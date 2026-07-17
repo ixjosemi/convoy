@@ -159,7 +159,7 @@ export async function initializeRepoWithInitialCommit(cwd: string, options: { ba
   }
 
   const commitArgs = porcelain.stdout.trim() === "" ? ["commit", "--allow-empty", "-m", "convoy: initial commit"] : ["commit", "-m", "convoy: initial commit"]
-  await execFile("git", commitArgs, { cwd, env: convoyGitEnv })
+  await execFile("git", commitArgs, { cwd })
 }
 
 export async function statusPorcelain(cwd: string): Promise<string> {
@@ -259,18 +259,8 @@ export async function addAllAndCommit(message: string, cwd: string) {
     )
   }
 
-  await execFile("git", ["commit", "-m", message], {
-    cwd,
-    env: convoyGitEnv,
-  })
+  await execFile("git", ["commit", "-m", message], { cwd })
   return true
-}
-
-const convoyGitEnv = {
-  GIT_AUTHOR_NAME: "convoy",
-  GIT_AUTHOR_EMAIL: "convoy@local",
-  GIT_COMMITTER_NAME: "convoy",
-  GIT_COMMITTER_EMAIL: "convoy@local",
 }
 
 const secretPatterns: RegExp[] = [

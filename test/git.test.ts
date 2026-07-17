@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { addWorktree, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
+import { addAllAndCommit, addWorktree, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
 
 describe("findSuspiciousStagedFiles", () => {
   test("flags common secret filenames", () => {
@@ -289,6 +289,34 @@ describe("initializeRepoWithInitialCommit", () => {
 
     await expect(initializeRepoWithInitialCommit(dir, { baseRef: "main" })).rejects.toThrow(/look like secrets/)
     expect(await repoBootstrapStatus(dir)).toBe("no-commits")
+  })
+})
+
+describe("addAllAndCommit", () => {
+  test("uses the target repository's configured Git identity", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-git-identity-"))
+    const git = async (...args: string[]) => {
+      const proc = Bun.spawn(["git", ...args], { cwd: dir, stdout: "pipe", stderr: "pipe" })
+      if ((await proc.exited) !== 0) throw new Error(await new Response(proc.stderr).text())
+    }
+
+    try {
+      await git("init", "-q")
+      await git("config", "user.name", "Repository User")
+      await git("config", "user.email", "repository.user@example.com")
+      await git("commit", "-q", "--allow-empty", "-m", "base")
+      await writeFile(join(dir, "change.txt"), "changed\n")
+
+      await addAllAndCommit("convoy(test): commit change", dir)
+
+      const proc = Bun.spawn(["git", "show", "-s", "--format=%an <%ae>|%cn <%ce>", "HEAD"], { cwd: dir, stdout: "pipe" })
+      expect((await new Response(proc.stdout).text()).trim()).toBe(
+        "Repository User <repository.user@example.com>|Repository User <repository.user@example.com>",
+      )
+      expect(await proc.exited).toBe(0)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 
