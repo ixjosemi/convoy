@@ -1,15 +1,18 @@
 import { readFile, stat } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 
-import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPath, loadMergedConvoyConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
+import { advisorAuthOf, authoringHarnessOf, runnerAuthOf, buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, featuresOf, globalConfigPath, loadMergedConvoyConfig, loadPipelineFile, pipelineDefaultsOf, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
 import { readControlFile } from "./control-client"
-import { detectBaseRef, currentBranch, listChangedFiles, resolveWorktreeDefault } from "./git"
+import { detectBaseRef, currentBranch, listChangedFiles, worktreeDefaultFor } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
 import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, hasWritableStep, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { consensusStep } from "./quality-score"
 import { defaultMaxConcurrentAgents, parseModel } from "./runner"
-import { buildRunPlan, type BuildRunPlanInput } from "./run-plan"
+import { buildRunPlan, defaultHelperRoute, soleCliRunner, type BuildRunPlanInput } from "./run-plan"
+import { parseModelOverride } from "./step-runners"
+import { helperModel } from "./helper-routes"
+import { defaultCommitMessageModel } from "./commit-message"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { loadPrdHistoryPreview } from "./prd-history"
 import { loadOpenSpecBundle, openSpecPromptFor } from "./openspec"
@@ -29,6 +32,8 @@ import type { UpdateResult } from "./update"
 import type { TuiRoute } from "./tui-session"
 import type { HomeDestination, HomeResolution, HomeWorkAction } from "./home-tui"
 import type { LocalActiveChange, ReadResult } from "./checkout-openspec"
+import type { RunsCommand } from "./runs-command"
+import type { SkillTarget } from "./skill-install"
 
 /**
  * Flags as written: every scalar stays undefined until the user sets it, so
@@ -40,6 +45,8 @@ export type ParsedArgs = {
   promptFile?: string
   help?: boolean
   pipeline?: string
+  /** --pipeline-file: run a pipeline defined in its own YAML file instead of a named one. */
+  pipelineFile?: string
   files: string[]
   onlySteps: string[]
   skipSteps: string[]
@@ -74,6 +81,8 @@ export type ParsedArgs = {
   gateway?: ModelGateway
   planOnly?: boolean
   noConfirm?: boolean
+  /** --detach: return once the coordinator is up instead of streaming the run to its end. */
+  detach?: boolean
   /** --change: explicit OpenSpec change ids, in review order (repeatable); selection is explicit only. */
   changes: string[]
   /** --manual: the explicit no-change run mode (valid with zero selected changes). */
@@ -91,6 +100,10 @@ export type CliCommand =
   | { type: "help"; text: string }
   | { type: "run"; options: RunOptions }
   | { type: "runs"; runID?: string }
+  | { type: "runs-query"; command: Exclude<RunsCommand, { kind: "browse" }> }
+  | { type: "pipelines"; targetDir: string; json: boolean; name?: string; pipelineFile?: string }
+  | { type: "skill"; action: "install" | "uninstall"; targets: SkillTarget[] }
+  | { type: "skill-show"; file?: string }
   | { type: "specs"; targetDir: string }
   | { type: "spin"; options: SpinOptions }
   | { type: "opencode-install" }
@@ -106,6 +119,8 @@ export type CliCommand =
   | { type: "version" }
   | { type: "update"; checkOnly: boolean }
   | { type: "coordinate"; launchPath: string }
+  | { type: "hook" }
+  | { type: "mcp"; args: string[] }
 
 export async function parseAndRun(argv: string[]) {
   if (shouldLaunchHome(argv, process.stdin.isTTY, process.stdout.isTTY)) {
@@ -140,11 +155,36 @@ export async function parseAndRun(argv: string[]) {
     await openRunsBrowser(command.runID)
     return
   }
+  if (command.type === "runs-query") {
+    const { printRunsJson, runAction, waitForRun } = await import("./runs-command")
+    const query = command.command
+    if (query.kind === "json") await printRunsJson(query.runID)
+    else if (query.kind === "wait") process.exitCode = await waitForRun(query.runID, { timeoutMs: query.timeoutMs, json: query.json })
+    else await runAction(query.runID, query.action)
+    return
+  }
+  if (command.type === "pipelines") {
+    const { runPipelinesCommand } = await import("./pipelines-command")
+    await runPipelinesCommand(command)
+    return
+  }
+  if (command.type === "skill") {
+    const { runSkillCommand } = await import("./skill-install")
+    process.exitCode = await runSkillCommand(command.action, command.targets)
+    return
+  }
+  if (command.type === "skill-show") {
+    const { skillFileText } = await import("./skill-install")
+    process.stdout.write(skillFileText(command.file))
+    return
+  }
   if (command.type === "specs") {
+    await assertSpecsEnabled(command.targetDir, "convoy specs")
     await openSpecsBrowser(command.targetDir)
     return
   }
   if (command.type === "spin") {
+    await assertSpecsEnabled(command.options.targetDir, "convoy spin")
     const { runSpin, printSpinHandoff } = await import("./spin")
     const result = await runSpin(command.options)
     printSpinHandoff(result)
@@ -153,6 +193,16 @@ export async function parseAndRun(argv: string[]) {
   if (command.type === "opencode-install") {
     const { runOpencodeInstallCommand } = await import("./opencode-install")
     await runOpencodeInstallCommand()
+    return
+  }
+  if (command.type === "hook") {
+    const { runHookCommand } = await import("./runners/commands")
+    await runHookCommand()
+    return
+  }
+  if (command.type === "mcp") {
+    const { runMcpCommand } = await import("./runners/commands")
+    await runMcpCommand(command.args)
     return
   }
   if (command.type === "close") {
@@ -251,7 +301,13 @@ export async function parseAndRun(argv: string[]) {
   } else {
     process.stdout.write(renderRunPlan(plan, true))
   }
-  await preflightRunPlan(plan)
+  // Without an auto-attached dashboard nobody answers a permission request:
+  // it holds until someone opens the run. Say so before an agent or script
+  // starts a run that would otherwise go quiet at its first ask.
+  if (plan.permissions === "interactive" && !(command.options.tui && process.stdout.isTTY)) {
+    log.warn("permissions: interactive — requests wait for an answer (`convoy runs <id> approve|deny <request>`, or the `convoy runs` dashboard); pass --smart or --yolo for an unattended run")
+  }
+  await preflightRunPlan(plan, undefined, { reviewed: interactive && !command.options.noConfirm })
   // Nothing has touched the repo yet; the worktree is the first effect, and only
   // once the plan has been accepted.
   let options = command.options
@@ -310,6 +366,22 @@ const mutatingHomeActions: ReadonlySet<HomeWorkAction> = new Set<HomeWorkAction>
 ])
 
 /** One alternate-screen owner routes every destination until Home itself quits. */
+/**
+ * The session loop when the launcher is the first screen: every return from a
+ * destination or a run reopens it, and leaving the launcher itself ends it.
+ */
+export async function runRootLauncherLoop(launch: () => Promise<"quit" | "continue">, interrupted: () => boolean): Promise<void> {
+  while (!interrupted()) {
+    if ((await launch()) === "quit") return
+  }
+}
+
+/** Refuses an OpenSpec-only command in a project that turned specs off. */
+async function assertSpecsEnabled(targetDir: string, command: string): Promise<void> {
+  if (featuresOf(await loadMergedConvoyConfig(targetDir).catch(() => undefined)).specs) return
+  throw new Error(`${command} needs OpenSpec, which this project turned off (features.specs: false)`)
+}
+
 async function runHomeSession(targetDir: string): Promise<void> {
   // Probe the Kitty graphics protocol before the session renderer takes
   // stdin; over SSH the client's environment doesn't travel, so the terminal
@@ -335,8 +407,16 @@ async function runHomeSession(targetDir: string): Promise<void> {
   // was viewing, by verified identity; the first open passes none and selects
   // New worktree. Persisted hints stay non-authoritative and never drive this.
   let lastSelection: { path: string; branch?: string } | undefined
+  const features = featuresOf(await loadMergedConvoyConfig(targetDir).catch(() => undefined))
 
   try {
+    // Without worktree management the session opens on Pipelines: the
+    // launcher is the root screen, reaching Runs, Config, and (when on) Specs,
+    // and its q ends the session.
+    if (!features.worktrees) {
+      await runRootLauncherLoop(() => launchInteractiveRun(targetDir, undefined, undefined, route, { root: true, specsDestination: features.specs }), () => interrupted)
+      return
+    }
     await runHomeNavigationLoop({
       interrupted: () => interrupted,
       route,
@@ -355,6 +435,7 @@ async function runHomeSession(targetDir: string): Promise<void> {
           onWorktreeSelected: (selection) => {
             lastSelection = selection
           },
+          specs: features.specs,
         }),
       openWork: async (worktree, action) => {
         await dispatchWorkAction(targetDir, route, worktree, action)
@@ -936,13 +1017,21 @@ async function buildReviewedPlan(input: BuildRunPlanInput): Promise<RunPlan> {
     branch,
     excludeRunID: input.resumeRunID || undefined,
   })
+  // `features.specs: false` keeps OpenSpec out of the plan entirely: nothing
+  // attached, no change selection required, and an explicit --change refused.
+  const specsEnabled = featuresOf(await loadMergedConvoyConfig(input.targetDir).catch(() => undefined)).specs
+  if (!specsEnabled && (input.changes?.length ?? 0) > 0) {
+    throw new Error("--change needs OpenSpec, which this project turned off (features.specs: false)")
+  }
   // An OpenSpec contract, when the repo has one: discovered against the launch
   // checkout (before any worktree isolate), so the launcher and `--change`
   // resolve the change the same way the runtime attaches it later.
-  const openspec = await loadOpenSpecBundle({
-    targetDir: input.targetDir,
-    explicitIds: input.changes,
-  })
+  const openspec = specsEnabled
+    ? await loadOpenSpecBundle({
+        targetDir: input.targetDir,
+        explicitIds: input.changes,
+      })
+    : undefined
   // Every explicitly requested id must resolve: a typo or an archived id
   // refuses the run naming it, rather than silently dropping that contract.
   const requested = input.changes ?? []
@@ -1031,9 +1120,17 @@ async function spawnAndAttachRun(options: RunOptions, plan: RunPlan, route?: Tui
       await rmPendingLaunch(pending.dir)
       return
     }
+    // --detach: the coordinator already survives this process, so hand the
+    // run back to the caller (an agent session, a script) and let it poll.
+    // The pending dir stays: it holds the log the coordinator is writing, and
+    // the sweep only removes it once that coordinator is gone.
+    if (options.detach) {
+      process.stdout.write(detachedRunMessage(ready.runID, child.pid, pending.logPath))
+      return
+    }
     // --no-tui / CI: don't attach; stream the coordinator's log to the
     // terminal, wait for its exit, and forward the exit code.
-    process.stdout.write(`coordinator ${child.pid} running; logs: ${pending.logPath}\n`)
+    process.stdout.write(`coordinator ${child.pid} running run ${ready.runID}; logs: ${pending.logPath}\n`)
     const forwarder = await forwardCoordinatorLogs(pending.logPath, (chunk) => process.stdout.write(chunk))
     const code = await child.exited
     await forwarder.stop()
@@ -1061,6 +1158,17 @@ async function spawnAndAttachRun(options: RunOptions, plan: RunPlan, route?: Tui
       throw error
     }
   }
+}
+
+/** What `--detach` prints: a stable `run <id> started` first line, then where to look and how to follow. */
+export function detachedRunMessage(runID: string, pid: number, logPath: string): string {
+  return [
+    `run ${runID} started (coordinator ${pid}, detached)`,
+    `log: ${logPath}`,
+    `follow: convoy runs ${runID} --wait`,
+    `status: convoy runs ${runID} --json`,
+    "",
+  ].join("\n")
 }
 
 /** Surfaces the coordinator's last words on a failed TTY run: its stderr went to the pending log, not this terminal. */
@@ -1136,12 +1244,18 @@ export async function prepareWorktreeForRun(sourceDir: string, options: RunOptio
   return { ...options, targetDir: worktree.dir, branch: worktree.branch, includeDirty: false }
 }
 
+/**
+ * Opens the run launcher and carries out what it resolves to. Answers "quit"
+ * when the operator left the launcher itself, so a root launcher (no worktree
+ * board) ends the session, and "continue" after a navigation or a run.
+ */
 async function launchInteractiveRun(
   targetDir: string,
   presetChanges?: readonly string[],
   presetFeature?: LaunchFeaturePreset,
   route?: TuiRoute,
-) {
+  navigation: { root?: boolean; specsDestination?: boolean } = {},
+): Promise<"quit" | "continue"> {
   // Imported lazily so normal CLI invocations don't pull in OpenTUI until they
   // explicitly ask for the zero-argument interactive launcher.
   const { launchRunTui } = await import("./launch-tui")
@@ -1159,23 +1273,29 @@ async function launchInteractiveRun(
       prepareRun: (runSelection) => prepareInteractiveRun(targetDir, runSelection),
       proposeBranchName: (input) => proposeInteractiveBranchName(targetDir, input),
       checkBranchName: (name) => checkInteractiveBranchName(targetDir, name),
+      ...navigation,
     },
     route,
   )
-  if (!selection) return
+  if (!selection) return "quit"
   if (selection.action === "runs") {
     await openRunsBrowser(undefined, route)
-    return
+    return "continue"
   }
   if (selection.action === "config") {
     await openConfigEditor(targetDir, route)
-    return
+    return "continue"
+  }
+  if (selection.action === "specs") {
+    await openSpecsBrowser(targetDir, route)
+    return "continue"
   }
 
   let options = selection.options
   const plan = selection.plan
   const runSelection = selection.selection
-  await preflightRunPlan(plan)
+  // The launcher's review screen is where the operator accepted this plan.
+  await preflightRunPlan(plan, undefined, { reviewed: true })
   if (runSelection.initializeGit) {
     const { initializeRepoWithInitialCommit } = await import("./git")
     await initializeRepoWithInitialCommit(targetDir, { baseRef: options.baseRef === "HEAD" ? undefined : options.baseRef })
@@ -1205,6 +1325,7 @@ async function launchInteractiveRun(
   // second writer in the claimed checkout exactly like the headless one.
   await refuseConflictingWriter(options.targetDir, plan)
   await executeRun(options, plan, route)
+  return "continue"
 }
 
 /**
@@ -1254,9 +1375,10 @@ export async function prepareInteractiveRun(targetDir: string, selection: Launch
 /** Asks the configured naming model for a branch name for the launcher's branch step. */
 async function proposeInteractiveBranchName(targetDir: string, input: { prompt: string; guidance?: string }): Promise<LaunchBranchProposal> {
   const { defaultBranchNameModel, proposeBranchName } = await import("./worktree")
+  const { helperAuth } = await import("./helper-routes")
   const config = await loadMergedConvoyConfig(targetDir)
-  const model = config?.defaults.branchNameModel ?? defaultBranchNameModel
-  const proposal = await proposeBranchName({ ...input, targetDir, model })
+  const model = helperModel("branchName", config?.defaults, defaultBranchNameModel)
+  const proposal = await proposeBranchName({ ...input, targetDir, model, auth: helperAuth(config, model) })
   return { ...proposal, model }
 }
 
@@ -1287,7 +1409,7 @@ async function openRunsBrowser(initialRunID?: string, route?: TuiRoute): Promise
       const options = await retryOptions(resolution.runID, resolution.targetDir)
       const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "retry" }))
       if (!(await confirmRunPlan(plan))) return false
-      await preflightRunPlan(plan)
+      await preflightRunPlan(plan, undefined, { reviewed: true })
       // A resumed/retried run is also a coordinator: same spawn + auto-attach path.
       await executeRun(options, plan, route)
       return true
@@ -1296,7 +1418,7 @@ async function openRunsBrowser(initialRunID?: string, route?: TuiRoute): Promise
       const options = await resumeOptions(resolution.runID, resolution.targetDir)
       const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "resume" }))
       if (!(await confirmRunPlan(plan))) return false
-      await preflightRunPlan(plan)
+      await preflightRunPlan(plan, undefined, { reviewed: true })
       await executeRun(options, plan, route)
       return true
     }
@@ -1389,8 +1511,15 @@ async function dispatchSpecsResolution(targetDir: string, resolution: SpecsResol
         // renderer this process no longer owns): the window flow.
         const view = await loadSpecsView(targetDir)
         const input = buildIterateSessionInput(targetDir, view, resolution.changeID)
-        const { openIterateOpencodeWindow } = await import("./opencode")
-        await openIterateOpencodeWindow(input)
+        const authoring = await authoringRouteFor(targetDir)
+        if (authoring.harness === "claude-code") {
+          // The selected harness, under its reviewed auth; no OpenCode involved.
+          const { openClaudeInteractiveWindow } = await import("./claude-code")
+          await openClaudeInteractiveWindow({ targetDir: input.targetDir, prompt: input.prompt, label: "claude iterate", ...(authoring.auth ? { auth: authoring.auth } : {}) })
+        } else {
+          const { openIterateOpencodeWindow } = await import("./opencode")
+          await openIterateOpencodeWindow(input)
+        }
       } else {
         await openCheckoutConversation({ launchDir: targetDir, route, checkout: resolution.checkout, displayName: resolution.changeID })
       }
@@ -1477,9 +1606,16 @@ async function checkoutPreset(checkout: string, requireBranch?: string): Promise
 export async function openCheckoutConversation(input: { launchDir: string; route: TuiRoute; checkout: string; displayName: string }): Promise<void> {
   const { createAuthoringConversation, openConversationForeground, validateAuthoringSession } = await import("./conversations")
 
-  const server = await resolveAuthoringServer({ launchDir: input.launchDir, checkout: input.checkout, route: input.route })
-  if (server.status === "blocked") return
-  const serviceHandle = server.status === "service" ? { url: server.url } : undefined
+  // The configured authoring harness; a Claude one needs no server at all.
+  const authoring = await authoringRouteFor(input.launchDir)
+  let serviceHandle: { url: string; password?: string } | undefined
+  const ensureServer = async (): Promise<boolean> => {
+    if (serviceHandle) return true
+    const server = await resolveAuthoringServer({ launchDir: input.launchDir, checkout: input.checkout, route: input.route })
+    if (server.status === "blocked") return false
+    if (server.status === "service") serviceHandle = { url: server.url, ...(server.password ? { password: server.password } : {}) }
+    return true
+  }
 
   // Resume the exactly linked session when a verifiable reference exists
   // (capability work-conversations): the stored reference is navigation
@@ -1497,9 +1633,11 @@ export async function openCheckoutConversation(input: { launchDir: string; route
   if (commonDir) {
     const linked = await readVerifiableConversationRef(commonDir, canonicalCheckout).catch(() => undefined)
     if (linked) {
+      // An exact session reopens on its own harness, whatever the default is now.
+      if (linked.ref.harness === "opencode" && !(await ensureServer())) return
       const validation = await validateAuthoringSession({ ref: linked.ref, checkout: input.checkout, ...(serviceHandle ? { server: serviceHandle } : {}) }).catch((error: unknown) => ({ status: "unavailable" as const, reason: error instanceof Error ? error.message : String(error) }))
       if (validation.status === "available") {
-        await openLinkedConversation(input, linked.ref, serviceHandle)
+        await openLinkedConversation(input, linked.ref, authoring.auth)
         return
       }
       await clearConversationRef(commonDir, canonicalCheckout).catch(() => {})
@@ -1512,7 +1650,8 @@ export async function openCheckoutConversation(input: { launchDir: string; route
     }
   }
 
-  const ref = await createAuthoringConversation({ checkout: input.checkout, title: input.displayName, ...(serviceHandle ? { server: serviceHandle } : {}) })
+  if (authoring.harness === "opencode" && !(await ensureServer())) return
+  const ref = await createAuthoringConversation({ checkout: input.checkout, title: input.displayName, harness: authoring.harness, ...(serviceHandle ? { server: serviceHandle } : {}) })
   if (commonDir && target) await saveConversationRef(commonDir, target, ref).catch(() => {})
   const { currentBranch } = await import("./git")
   const branch = (await currentBranch(input.checkout).catch(() => undefined)) ?? ""
@@ -1521,8 +1660,8 @@ export async function openCheckoutConversation(input: { launchDir: string; route
   // The shared foreground host owns the suspend/clear/resume lifecycle; the
   // conversation client owns the terminal until it exits (design D4).
   const renderer = input.route.session.renderer
-  const exitCode = await openConversationForeground({ checkout: input.checkout, ref, suspend: () => renderer.suspend(), resume: () => renderer.resume() })
-  await releaseAuthoringWriterIfIdle({ launchDir: input.launchDir, checkout: input.checkout, branch, sessionId: ref.sessionId })
+  const exitCode = await openConversationForeground({ checkout: input.checkout, ref, ...(authoring.auth ? { auth: authoring.auth } : {}), suspend: () => renderer.suspend(), resume: () => renderer.resume() })
+  await releaseAuthoringWriterIfIdle({ launchDir: input.launchDir, checkout: input.checkout, branch, ref, foregroundExited: true })
   if (exitCode !== 0) {
     await reportHandoffBlocker(
       `the conversation client exited with code ${exitCode}`,
@@ -1535,16 +1674,16 @@ export async function openCheckoutConversation(input: { launchDir: string; route
 /** Opens a verified linked session in the foreground and returns to the same checkout (shared by create and resume). */
 async function openLinkedConversation(
   input: { launchDir: string; checkout: string; route: TuiRoute; displayName: string },
-  ref: { harness: "opencode"; sessionId: string },
-  serviceHandle: { url: string } | undefined,
+  ref: import("./conversations").AuthoringSessionRef,
+  auth?: import("./runners/contracts").AuthenticationSelection,
 ): Promise<void> {
   const { openConversationForeground } = await import("./conversations")
   const { currentBranch } = await import("./git")
   const branch = (await currentBranch(input.checkout).catch(() => undefined)) ?? ""
   if (!(await claimAuthoringWriter({ launchDir: input.launchDir, checkout: input.checkout, branch, sessionId: ref.sessionId, route: input.route }))) return
   const renderer = input.route.session.renderer
-  const exitCode = await openConversationForeground({ checkout: input.checkout, ref, suspend: () => renderer.suspend(), resume: () => renderer.resume() })
-  await releaseAuthoringWriterIfIdle({ launchDir: input.launchDir, checkout: input.checkout, branch, sessionId: ref.sessionId })
+  const exitCode = await openConversationForeground({ checkout: input.checkout, ref, ...(auth ? { auth } : {}), suspend: () => renderer.suspend(), resume: () => renderer.resume() })
+  await releaseAuthoringWriterIfIdle({ launchDir: input.launchDir, checkout: input.checkout, branch, ref, foregroundExited: true })
   if (exitCode !== 0) {
     await reportHandoffBlocker(
       `the conversation client exited with code ${exitCode}`,
@@ -1565,9 +1704,13 @@ async function openLinkedConversation(
 async function openCheckoutConversationExternal(input: { launchDir: string; checkout: string; branch: string; route?: TuiRoute }): Promise<void> {
   const { createAuthoringConversation, openConversationExternal, validateAuthoringSession } = await import("./conversations")
 
-  const serverResolution = await resolveAuthoringServer({ launchDir: input.launchDir, checkout: input.checkout, route: input.route })
-  if (serverResolution.status === "blocked") return
-  const serviceHandle = serverResolution.status === "service" ? { url: serverResolution.url } : undefined
+  const authoring = await authoringRouteFor(input.launchDir)
+  let serviceHandle: { url: string; password?: string } | undefined
+  if (authoring.harness === "opencode") {
+    const serverResolution = await resolveAuthoringServer({ launchDir: input.launchDir, checkout: input.checkout, route: input.route })
+    if (serverResolution.status === "blocked") return
+    if (serverResolution.status === "service") serviceHandle = { url: serverResolution.url, ...(serverResolution.password ? { password: serverResolution.password } : {}) }
+  }
 
   // The external pane presents the same exact session reference as the
   // foreground presentation: a verifiable linked session is reused, never
@@ -1575,10 +1718,11 @@ async function openCheckoutConversationExternal(input: { launchDir: string; chec
   const { repoCommonDir } = await import("./repo-store")
   const { readVerifiableConversationRef, saveConversationRef } = await import("./session-hints")
   const commonDir = await repoCommonDir(input.launchDir).catch(() => undefined)
-  let ref: { harness: "opencode"; sessionId: string } | undefined
+  let ref: import("./conversations").AuthoringSessionRef | undefined
   if (commonDir) {
     const linked = await readVerifiableConversationRef(commonDir, input.checkout).catch(() => undefined)
-    if (linked) {
+    // A linked session on another harness is not this flow's to reopen without its server.
+    if (linked && linked.ref.harness === authoring.harness) {
       const validation = await validateAuthoringSession({ ref: linked.ref, checkout: input.checkout, ...(serviceHandle ? { server: serviceHandle } : {}) }).catch(() => ({ status: "unavailable" as const, reason: "probe failed" }))
       if (validation.status === "available") ref = linked.ref
     }
@@ -1587,6 +1731,7 @@ async function openCheckoutConversationExternal(input: { launchDir: string; chec
     ref = await createAuthoringConversation({
       checkout: input.checkout,
       title: input.branch,
+      harness: authoring.harness,
       ...(serviceHandle ? { server: serviceHandle } : {}),
     })
     if (commonDir) {
@@ -1600,6 +1745,7 @@ async function openCheckoutConversationExternal(input: { launchDir: string; chec
     checkout: input.checkout,
     ref,
     ...(serviceHandle ? { server: serviceHandle } : {}),
+    ...(authoring.auth ? { auth: authoring.auth } : {}),
   })
   if (outcome.status === "failed") {
     // No pane was created, so no writer was started: release the claim this
@@ -1619,18 +1765,23 @@ async function openCheckoutConversationExternal(input: { launchDir: string; chec
  * never renames the worktree's branch.
  */
 async function proposeInCheckout(input: { launchDir: string; route: TuiRoute; checkout: string; branch: string; displayName: string }): Promise<void> {
+  const authoring = await authoringRouteFor(input.launchDir)
+  if (authoring.harness === "claude-code") {
+    await proposeInCheckoutWithClaude(input, authoring.auth)
+    return
+  }
   const { bootOpencodeServerFrom } = await import("./opencode")
   const { createAuthoringConversation, listAuthoringCommands, invokeAuthoringCommand, openConversationForeground } = await import("./conversations")
   const { startProposalCommand } = await import("./propose-service")
 
   const serverResolution = await resolveAuthoringServer({ launchDir: input.launchDir, checkout: input.checkout, route: input.route })
   if (serverResolution.status === "blocked") return
-  let serviceHandle: { url: string } | undefined
-  let helper: { url: string; close?(): void | Promise<unknown> } | undefined
+  let serviceHandle: { url: string; password?: string } | undefined
+  let helper: { url: string; password?: string; close?(): void | Promise<unknown> } | undefined
   if (serverResolution.status === "service") {
     // An injected service URL conveys no shutdown right: the independent
     // service owner remains authoritative (design D1).
-    serviceHandle = { url: serverResolution.url }
+    serviceHandle = { url: serverResolution.url, ...(serverResolution.password ? { password: serverResolution.password } : {}) }
   } else {
     const booted = await bootOpencodeServerFrom(input.checkout).catch(() => undefined)
     if (booted) {
@@ -1659,7 +1810,7 @@ async function proposeInCheckout(input: { launchDir: string; route: TuiRoute; ch
   // return, and the independent service is established strictly before the
   // command runs, so no command ever executes under recoverable helper
   // ownership.
-  const outcome = await startProposalCommand(helper ? { kind: "helper", url: serviceHandle.url } : { kind: "independent", url: serviceHandle.url }, {
+  const outcome = await startProposalCommand(helper ? { kind: "helper", url: serviceHandle.url, ...(serviceHandle.password ? { password: serviceHandle.password } : {}) } : { kind: "independent", url: serviceHandle.url, ...(serviceHandle.password ? { password: serviceHandle.password } : {}) }, {
     listCommands: (server) => listAuthoringCommands({ checkout: input.checkout, server }),
     transfer: async () => {
       if (!commonDir) return { status: "unavailable" as const, reason: "this checkout has no repository storage for an independent authoring service" }
@@ -1693,7 +1844,7 @@ async function proposeInCheckout(input: { launchDir: string; route: TuiRoute; ch
     releaseClaim: async () => {
       if (claimed && commonDir) await releaseWriterClaim({ commonDir, branch: input.branch, ownerPid: process.pid }).catch(() => {})
     },
-    createConversation: (server) => createAuthoringConversation({ checkout: input.checkout, title: input.displayName, server }),
+    createConversation: (server) => createAuthoringConversation({ checkout: input.checkout, title: input.displayName, server }) as Promise<{ harness: "opencode"; sessionId: string }>,
     invokeCommand: ({ ref, server, command }) => invokeAuthoringCommand({ ref, server, command }),
   })
 
@@ -1711,10 +1862,64 @@ async function proposeInCheckout(input: { launchDir: string; route: TuiRoute; ch
 
   const renderer = input.route.session.renderer
   const exitCode = await openConversationForeground({ checkout: input.checkout, ref: outcome.ref, suspend: () => renderer.suspend(), resume: () => renderer.resume() })
-  await releaseAuthoringWriterIfIdle({ launchDir: input.launchDir, checkout: input.checkout, branch: input.branch, sessionId: outcome.ref.sessionId })
+  await releaseAuthoringWriterIfIdle({ launchDir: input.launchDir, checkout: input.checkout, branch: input.branch, ref: outcome.ref })
   if (exitCode !== 0) {
     await reportHandoffBlocker(`the authoring client exited with code ${exitCode}`, ["reopen the worktree to continue"], input.route)
   }
+}
+
+/**
+ * The proposal workflow through Claude: the project's own slash command
+ * (`.claude/commands/`), found the way OpenCode's is, starts a fresh exact
+ * session as its first message under the writer claim. No server is needed;
+ * a project without the command reports that rather than imitating it.
+ */
+async function proposeInCheckoutWithClaude(
+  input: { launchDir: string; route: TuiRoute; checkout: string; branch: string; displayName: string },
+  auth: import("./runners/contracts").AuthenticationSelection | undefined,
+): Promise<void> {
+  const { createAuthoringConversation, listClaudeAuthoringCommands, openConversationForeground } = await import("./conversations")
+  const { findProposalCommand } = await import("./propose-service")
+  const command = findProposalCommand(await listClaudeAuthoringCommands(input.checkout))
+  if (!command) {
+    await reportHandoffBlocker(
+      "this project has no supported proposal workflow command (looked for opsx:propose under .claude/commands/)",
+      ["check the project's .claude/commands/ directory — Convoy does not install commands into it", "open an ordinary conversation in the worktree instead"],
+      input.route,
+    )
+    return
+  }
+  const ref = await createAuthoringConversation({ checkout: input.checkout, harness: "claude-code" })
+  if (!(await claimAuthoringWriter({ launchDir: input.launchDir, checkout: input.checkout, branch: input.branch, sessionId: ref.sessionId, route: input.route }))) return
+  const { repoCommonDir } = await import("./repo-store")
+  const { saveConversationRef } = await import("./session-hints")
+  const { observeCheckoutTarget } = await import("./worktree-target")
+  const commonDir = await repoCommonDir(input.launchDir).catch(() => undefined)
+  const target = await observeCheckoutTarget(input.checkout).catch(() => undefined)
+  if (commonDir && target) await saveConversationRef(commonDir, target, ref).catch(() => {})
+  const renderer = input.route.session.renderer
+  const exitCode = await openConversationForeground({ checkout: input.checkout, ref, ...(auth ? { auth } : {}), prompt: `/${command}`, suspend: () => renderer.suspend(), resume: () => renderer.resume() })
+  await releaseAuthoringWriterIfIdle({ launchDir: input.launchDir, checkout: input.checkout, branch: input.branch, ref, foregroundExited: true })
+  if (exitCode !== 0) await reportHandoffBlocker(`the authoring client exited with code ${exitCode}`, ["reopen the worktree to continue"], input.route)
+}
+
+/**
+ * The harness authoring flows open (`defaults.authoring.runner`, else the
+ * run-wide `defaults.runner` when it can host a conversation, else OpenCode)
+ * and, for a runner that authenticates, the reviewed authentication:
+ * `defaults.authoring.authMode` with that runner's credential reference,
+ * else its configured auth.
+ */
+async function authoringRouteFor(launchDir: string): Promise<import("./conversations").AuthoringRoute> {
+  const { runnerDescriptor } = await import("./runners/descriptors")
+  const config = await loadMergedConvoyConfig(launchDir).catch(() => undefined)
+  const defaults = config?.defaults
+  const harness = authoringHarnessOf(config)
+  if (!runnerDescriptor(harness).authenticates) return { harness: harness as import("./conversations").AuthoringHarness }
+  const configuredAuth = runnerAuthOf(config)[harness]
+  const mode = defaults?.authoring?.authMode
+  const auth = mode === "api-key" ? { mode, ...(configuredAuth?.credentialRef ? { credentialRef: configuredAuth.credentialRef } : {}) } : mode ? { mode } : (configuredAuth ?? { mode: "subscription" as const })
+  return { harness: harness as import("./conversations").AuthoringHarness, auth }
 }
 
 /** Reports an unavailable handoff without launching anything. */
@@ -1741,13 +1946,13 @@ async function reportHandoffBlocker(reason: string, remediation: readonly string
  *   unanswerable URL) or its discovery record is unreadable: fail closed and
  *   report, never boot a second server over unverified state.
  */
-async function resolveAuthoringServer(input: { launchDir: string; checkout: string; route?: TuiRoute }): Promise<{ status: "service"; url: string } | { status: "fallback" } | { status: "blocked"; reason: string }> {
+async function resolveAuthoringServer(input: { launchDir: string; checkout: string; route?: TuiRoute }): Promise<{ status: "service"; url: string; password?: string } | { status: "fallback" } | { status: "blocked"; reason: string }> {
   const { repoCommonDir } = await import("./repo-store")
   const commonDir = await repoCommonDir(input.launchDir).catch(() => undefined)
   if (!commonDir) return { status: "fallback" }
   const { ensureConversationService } = await import("./conversation-service")
   const service = await ensureConversationService({ commonDir, checkout: input.checkout }).catch((error: unknown) => ({ status: "unavailable" as const, reason: error instanceof Error ? error.message : String(error) }))
-  if (service.status === "live") return { status: "service", url: service.url }
+  if (service.status === "live") return { status: "service", url: service.url, ...(service.password ? { password: service.password } : {}) }
   if (service.status === "uncertain") {
     await reportHandoffBlocker(service.reason, ["the service is kept running and nothing was booted over it — resolve its state, then retry"], input.route)
     return { status: "blocked", reason: service.reason }
@@ -1778,30 +1983,37 @@ async function claimAuthoringWriter(input: { launchDir: string; checkout: string
 }
 
 /** Releases the authoring claim when the session is provably quiescent (design D5). */
-async function releaseAuthoringWriterIfIdle(input: { launchDir: string; checkout: string; branch: string; sessionId: string }): Promise<void> {
+async function releaseAuthoringWriterIfIdle(input: { launchDir: string; checkout: string; branch: string; ref: import("./conversations").AuthoringSessionRef; foregroundExited?: boolean }): Promise<void> {
   const { repoCommonDir } = await import("./repo-store")
   const { releaseWriterClaim } = await import("./writer-claims")
   const { sessionActivity } = await import("./conversations")
   const commonDir = await repoCommonDir(input.launchDir).catch(() => undefined)
   if (!commonDir) return
+  // A Claude conversation runs only inside its client: once the foreground
+  // client exited, the session is provably quiescent. Anything else keeps
+  // the claim for later reconciliation.
+  if (input.ref.harness === "claude-code") {
+    if (input.foregroundExited) await releaseWriterClaim({ commonDir, branch: input.branch, owner: input.ref.sessionId })
+    return
+  }
   // The activity query goes through the authoring service when one is live
   // (task 4.3) so the answer reflects the same server the work ran on; any
   // discovery failure falls back to the adapter's bounded boot, and either
   // failure reads as "unknown" — which keeps the claim. No blockers are
   // reported here: the release path is bookkeeping, not a user handoff.
-  let serviceHandle: { url: string } | undefined
+  let serviceHandle: { url: string; password?: string } | undefined
   try {
     const { ensureConversationService } = await import("./conversation-service")
     const service = await ensureConversationService({ commonDir, checkout: input.checkout })
-    if (service.status === "live") serviceHandle = { url: service.url }
+    if (service.status === "live") serviceHandle = { url: service.url, ...(service.password ? { password: service.password } : {}) }
   } catch {
     serviceHandle = undefined
   }
-  const activity = await sessionActivity({ checkout: input.checkout, ref: { harness: "opencode", sessionId: input.sessionId }, ...(serviceHandle ? { server: serviceHandle } : {}) }).catch(() => "unknown" as const)
+  const activity = await sessionActivity({ checkout: input.checkout, ref: input.ref, ...(serviceHandle ? { server: serviceHandle } : {}) }).catch(() => "unknown" as const)
   // A busy or unanswerable session keeps its claim: view detachment is not
   // evidence the agent stopped (design D5). The claim's staleness rules
   // reconcile it later if the process is gone.
-  if (activity === "idle") await releaseWriterClaim({ commonDir, branch: input.branch, owner: input.sessionId })
+  if (activity === "idle") await releaseWriterClaim({ commonDir, branch: input.branch, owner: input.ref.sessionId })
 }
 
 // The browser resumes with default flags; metadata recovers both the repo the
@@ -1937,9 +2149,21 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   }
   if (argv[0] === "runs") {
     const rest = argv.slice(1)
-    if (rest.length > 1) throw new Error("usage: convoy runs [run-id]")
-    if (rest[0] !== undefined && !isValidRunID(rest[0])) throw new Error(`invalid run id: ${rest[0]}`)
-    return { type: "runs", runID: rest[0] }
+    const { parseRunsArgs, runsHelp } = await import("./runs-command")
+    if (rest.some((arg) => arg === "--help" || arg === "-h")) return { type: "help", text: runsHelp() }
+    const parsed = parseRunsArgs(rest)
+    // The bare and run-id forms keep the browser (plain text off a terminal);
+    // --json, --wait, and the answers are the scripted surface.
+    if (parsed.kind === "browse") return { type: "runs", runID: parsed.runID }
+    return { type: "runs-query", command: parsed }
+  }
+  if (argv[0] === "pipelines") {
+    const { parsePipelinesArgs } = await import("./pipelines-command")
+    return parsePipelinesArgs(argv.slice(1))
+  }
+  if (argv[0] === "skill") {
+    const { parseSkillArgs } = await import("./skill-install")
+    return parseSkillArgs(argv.slice(1))
   }
   if (argv[0] === "specs") {
     // No positionals or flags yet — the viewer reads the whole OpenSpec state.
@@ -2030,6 +2254,9 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     if (rest[0] !== "install" || rest.length > 1) throw new Error("usage: convoy opencode install")
     return { type: "opencode-install" }
   }
+
+  if (argv[0] === "hook") return { type: "hook" }
+  if (argv[0] === "mcp") return { type: "mcp", args: argv.slice(1) }
 
   const parsed = parseArgs(argv)
   if (parsed.help) return { type: "help", text: help() }
@@ -2252,19 +2479,21 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   const config = await loadMergedConvoyConfig(parsed.targetDir)
   const defaults = config?.defaults ?? {}
 
-  const humanReview = parsed.humanReview ?? Boolean(process.stdin.isTTY && process.stdout.isTTY)
+  // A detached run has nobody at its gates, whatever the terminal says.
+  const humanReview = parsed.humanReview ?? (!parsed.detach && Boolean(process.stdin.isTTY && process.stdout.isTTY))
 
   const agents = buildAgentRegistry(config)
-  const pipelineName = parsed.pipeline ?? defaults.pipeline ?? defaultPipelineName
+  // A pipeline file is read before the try below: unlike a config that broke
+  // since a resume's run started, a bad file is always the caller's error.
+  const pipelineFile = parsed.pipelineFile ? await loadPipelineFile(resolve(process.cwd(), parsed.pipelineFile)) : undefined
+  const pipelineName = pipelineFile?.name ?? parsed.pipeline ?? defaults.pipeline ?? defaultPipelineName
   let pipeline: Pipeline
   try {
     pipeline = resolvePipeline({
       name: pipelineName,
-      spec: selectPipelineSpec(config, pipelineName),
+      spec: pipelineFile?.spec ?? selectPipelineSpec(config, pipelineName),
       agents,
-      defaultModel: defaults.model,
-      defaultAdvisor: defaults.advisor,
-      defaultAdvisorMaxCalls: defaults.advisorMaxCalls,
+      ...pipelineDefaultsOf(defaults),
     })
   } catch (error) {
     // A resumed run replays the pipeline frozen in its metadata; a config
@@ -2281,8 +2510,19 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   if (parsed.smartModel) parseModel(splitModelVariant(parsed.smartModel).model)
   // Smart auto-accept always needs a concrete judge model; resolve the fallback
   // chain here so the runner can stay oblivious to config and built-in defaults.
+  // A Claude-only plan inherits its own runner for the judge (a Claude-scoped
+  // --model, else Haiku) instead of an OpenCode model it could not run.
+  // A plan on one CLI runner inherits that runner for the judge (a
+  // runner-scoped --model, else the runner's helper model) instead of an
+  // OpenCode model it could not run.
+  const scopedOverride = parseModelOverride(parsed.modelOverride)
+  const soleRunner = soleCliRunner(pipeline)
   const smartJudgeModel =
-    parsed.smartModel || defaults.autoAcceptJudgeModel || parsed.modelOverride || defaults.model || `${defaultGptModel}#${defaultGptVariant}`
+    parsed.smartModel ||
+    defaults.autoAcceptJudgeModel ||
+    (soleRunner
+      ? defaultHelperRoute(soleRunner, scopedOverride.scope === soleRunner && scopedOverride.model ? scopedOverride.model : undefined)
+      : parsed.modelOverride || defaults.model || `${defaultGptModel}#${defaultGptVariant}`)
 
   // Goal execution is enabled exclusively by the pipeline's own terminal goal
   // step: `pipeline.goalPlan` was resolved and validated by resolvePipeline, and
@@ -2301,7 +2541,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     advisorOverride: parsed.advisorOverride ?? "",
     advisorDisabled: parsed.advisorDisabled ?? false,
     advisorAuditPolicy: defaults.advisorAuditPolicy ?? "summary",
-    tui: parsed.tui ?? Boolean(process.stdout.isTTY && process.stderr.isTTY),
+    tui: parsed.detach ? false : (parsed.tui ?? Boolean(process.stdout.isTTY && process.stderr.isTTY)),
     notify: parsed.notify,
     notifications: config?.notifications ?? {},
     humanReview,
@@ -2311,17 +2551,22 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     // A resumed run continues in the directory its metadata recorded — which is
     // already the worktree, when the original run made one — so it never creates
     // another.
-    worktree: parsed.resumeRunID ? false : await resolveWorktreeOption(parsed, defaults),
+    worktree: parsed.resumeRunID ? false : await resolveWorktreeOption(parsed, defaults, featuresOf(config).worktrees),
     ...(parsed.branch ? { branch: parsed.branch } : {}),
     includeDirty: parsed.includeDirty ?? false,
     yolo: parsed.yolo ?? false,
     smart: parsed.smart ?? false,
     smartJudgeModel,
+    commitMessageModel: helperModel("commitMessage", defaults, defaultCommitMessageModel, soleRunner),
+    ...(advisorAuthOf(config) ? { advisorAuth: advisorAuthOf(config)! } : {}),
+    ...(Object.keys(runnerAuthOf(config)).length > 0 ? { runnerAuth: runnerAuthOf(config) } : {}),
     gateway: parsed.gateway ?? config?.modelRouting?.gateway ?? "configured",
     gatewayExplicit: parsed.gateway !== undefined,
     modelRoutingOverrides: config?.modelRouting?.overrides ?? {},
     planOnly: parsed.planOnly ?? false,
-    noConfirm: parsed.noConfirm ?? false,
+    // Detaching is a decision to start now: there is no review screen to return to.
+    noConfirm: Boolean(parsed.noConfirm || parsed.detach),
+    ...(parsed.detach ? { detach: true } : {}),
     pipeline,
     agents,
     permissions: config?.permissions ?? { allow: [], deny: [] },
@@ -2336,15 +2581,16 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   return options
 }
 
-// Worktree source: flag > config defaults.worktree > the current branch.
+// Worktree source: flag > config defaults.worktree > features.worktrees off >
+// the current branch.
 // An unset config means "decide per branch", not "always isolate": on a trunk a
 // run should get its own worktree, but on a branch you're already where you
 // want the work. The launcher applies the same default itself, so an interactive
 // run reaches this with parsed.worktree already set.
-async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<boolean> {
+async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefaults, worktreesEnabled: boolean): Promise<boolean> {
   const explicit = parsed.worktree ?? defaults.worktree
   if (explicit !== undefined) return explicit
-  const auto = await resolveWorktreeDefault(parsed.targetDir)
+  const auto = await worktreeDefaultFor(parsed.targetDir, worktreesEnabled)
   log.info(`worktree: ${auto.isolate ? "on" : "off"} (${auto.reason})`)
   return auto.isolate
 }
@@ -2408,6 +2654,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "-p":
         parsed.pipeline = takeValue()
         break
+      case "--pipeline-file":
+        parsed.pipelineFile = takeValue()
+        break
       case "--only":
         parsed.onlySteps.push(...listValue(takeValue()))
         break
@@ -2460,6 +2709,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "--no-confirm":
         if (value !== undefined) throw new Error("--no-confirm does not take a value")
         parsed.noConfirm = true
+        break
+      case "--detach":
+        if (value !== undefined) throw new Error("--detach does not take a value")
+        parsed.detach = true
         break
       case "--tui":
         parsed.tui = true
@@ -2538,6 +2791,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
   }
 
   if (positional.length > 0) parsed.prompt = positional.join(" ")
+  if (parsed.pipeline !== undefined && parsed.pipelineFile !== undefined) throw new Error("use either --pipeline or --pipeline-file, not both")
+  if (parsed.resumeRunID !== undefined && parsed.pipelineFile !== undefined) {
+    throw new Error("--resume replays the pipeline the run started with; it can't take --pipeline-file")
+  }
+  if (parsed.detach && parsed.tui) throw new Error("--detach runs without a dashboard; drop --tui")
+  if (parsed.detach && parsed.planOnly) throw new Error("--plan never starts a run; drop --detach")
   return parsed
 }
 
@@ -2612,17 +2871,21 @@ export function retiredFeatureDiagnostic(args: string[]): string {
 function help() {
   return `convoy [prompt]
 
-Sequential OpenCode agent pipeline for implementing features.
+Sequential agent pipeline for implementing features, on OpenCode, Claude Code, or Codex.
 
 Usage:
   convoy
   convoy "Add onboarding"
   convoy --prompt-file prd.md --file lib/onboarding --file test/onboarding_test.dart
   convoy --pipeline bug-fix --prompt-file bug.md
+  convoy --pipeline-file audit.yaml --prompt-file task.md --manual --smart --detach
   convoy init
   convoy agents eject <agent>
   convoy update [--check]
-  convoy runs [run-id]
+  convoy runs [run-id] [--json] [--wait]
+  convoy runs <run-id> approve|deny <request-id> | abort
+  convoy pipelines [show <name>] [--json]
+  convoy skill install
   convoy specs
   convoy worktrees [--help]
   convoy publish [--yes] [--dry-run]
@@ -2642,7 +2905,18 @@ Commands:
   update [--check]         Check GitHub Releases for a newer official binary, or install it
                            (source checkouts are never modified)
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
-                           or open a subshell in its run dir (under ~/.convoy/runs)
+                           or open a subshell in its run dir (under ~/.convoy/runs).
+                           Off a terminal it prints plain text: the history, or for a
+                           run id its "run <id>: <status>" line, phases, and summary.
+                           --json prints it as data, --wait blocks until the run ends or
+                           needs an answer, and approve/deny/abort answer a detached run
+                           ("convoy runs --help" for the full surface)
+  pipelines                List the runnable pipelines (built-in, global, project) and the agents
+                           to compose with; "show <name>" prints one pipeline's resolved steps,
+                           "show --pipeline-file <path>" validates a pipeline file
+  skill install            Install the Convoy agent skill for Claude Code, OpenCode, and Codex, so
+                           a session can compose, launch, and monitor pipelines itself
+                           ("convoy skill --help"; "convoy skill show" prints it)
   worktrees                The worktree control center: every registered checkout with
                            its independent Git/OpenSpec facts, plus guarded fetch, sync,
                            push, archive, remove, delete-branch, and recover actions
@@ -2665,7 +2939,8 @@ Commands:
   opencode install          Install the global /convoy-spin OpenCode command — a thin wrapper at
                              ~/.config/opencode/commands/convoy-spin.md that runs convoy spin
                              from a session (opt-in, idempotent; touches no other command file)
-  config                   View and edit the global (~/.convoy) and current project config in a TUI
+  config                   Toggle the worktrees and specs features, list the global (~/.convoy) and
+                           project config files, show whether each loads, and open one in $EDITOR
   auth openrouter          Store an OpenRouter management key in the macOS Keychain for the
                            header credits meter (--remove deletes it; "auth status" lists sources)
 
@@ -2676,6 +2951,9 @@ Flags:
    --pipeline, -p <name>    Pipeline to run (default: "full-cycle"), which writes,
                             audits, then measures and iterates on a terminal goal
                             step until the score clears 90
+  --pipeline-file <path>   Run a pipeline defined in its own YAML file: the mapping a
+                           pipelines.<name> entry takes, plus an optional name
+                           (default: the file name). Nothing in your config changes
   --only <steps>           Run only these pipeline steps
   --skip <steps>           Skip these pipeline steps
   --resume <id>            Resume a previous run by its ID (steps with an existing report are
@@ -2686,7 +2964,7 @@ Flags:
   --smart                  Smart auto-accept: an AI judge auto-allows safe ask-level requests and escalates risky ones (shift+tab cycles)
   --smart-model <provider/model[#variant]> Model for the smart auto-accept judge (default: defaults.autoAcceptJudgeModel, else the run's model)
   --include-dirty          Include existing changes in the first commit
-  --model <provider/model[#variant]> Force a model for OpenCode steps (Claude Code steps keep their CLI model)
+  --model <provider/model[#variant]> Force a model for OpenCode steps; <runner>/<model> (codex/gpt-5.5, claude-code/opus) forces one runner's steps
   --advisor <provider/model[#variant]> Force an advising model on every OpenCode step: a stronger model
                            consulted at decision points (before the first write, before declaring done,
                            and on demand) that reads the step's transcript but never runs tools
@@ -2694,12 +2972,16 @@ Flags:
   --gateway <${modelGateways.join("|")}> Route all OpenCode models through the selected gateway
   --plan                   Print the complete resolved plan without creating or running anything
   --no-confirm             Show a compact plan and start without the interactive confirmation
+  --detach                 Start the run in the background and return once it is up, printing
+                           "run <id> started"; follow it with convoy runs <id> --wait.
+                           Implies --no-tui, --no-confirm, and no human steps
   --tui                    Show visual phase progress (default in interactive terminals)
   --no-tui                 Disable visual phase progress
   --notify                 Enable desktop notifications for this run, overriding notifications.enabled in config
   --no-notify              Disable desktop notifications for this run (the terminal title still updates)
   --human-step             Enable human steps (alias: --human-review; default in interactive terminals)
-  --no-human-step          Drop all human steps (alias: --no-human-review)
+  --no-human-step          Drop all human steps and failure decisions: a failed step fails the run
+                           (alias: --no-human-review; default off a terminal)
   --max-concurrent <n>     Max agents running at once within a parallel group (default: ${defaultMaxConcurrentAgents}); smaller groups are unaffected
   --base <ref>             Branch/base for calculating diffs (default: auto-detected — origin's default branch, else main/master/develop/trunk, else the current branch)
   --worktree               Run on a fresh branch in its own worktree
@@ -2719,6 +3001,17 @@ Flags:
                            --change or --manual.
   --dir <path>             Target repo (default: cwd)
 
+Headless (scripts, CI, agents):
+  Off a terminal, a launch prints the plan, then "coordinator <pid> running run <id>",
+  streams the run's log, and exits with the run's own code (0 only on success).
+  With --detach it returns as soon as the run is up instead. Pass --change or
+  --manual (not needed with features.specs: false), plus --smart or --yolo: with
+  interactive permissions a request waits (logged as "[permission] waiting for an
+  answer") until someone answers it with "convoy runs <id> approve|deny <request>"
+  or from the "convoy runs" dashboard. "convoy runs <id> --json" prints that run's
+  status, and "convoy runs <id> --wait" blocks until it ends or needs an answer.
+  "convoy skill install" teaches agent sessions this workflow.
+
 Goal mode:
   Pipelines enter goal execution exclusively by declaring one terminal goal
   step (the pipeline's last step). There are no goal CLI flags; retired flags
@@ -2732,12 +3025,15 @@ Config files:
 
 Config keys:
   defaults:                model, baseRef, pipeline, worktree, worktreeLocation, prdHistory,
-                           autoAcceptJudgeModel, branchNameModel, commitMessageModel
-  modelRouting:            gateway and explicit per-logical-model overrides
+                           autoAcceptJudgeModel, branchNameModel, commitMessageModel,
+                           runner, advisorRoute, helperRoutes, authoring (claudeAuth: legacy)
+  runners:                 per-runner settings: runners.<claude-code|codex>.auth
+  modelRouting:            gateway and explicit per-logical-model overrides (OpenCode)
   agents:                  project agents or built-in overrides; prompts live at agents/<name>.md
   pipelines:               named step lists mixing agents and human gates
   permissions:             allow/deny additions to the bash policy (deny always wins)
   hooks:                   pre/post shell commands, globally or per pipeline
+  features:                worktrees and specs switches (each on unless set to false)
   attachments:             files attached to every step
   The same schema lives globally at ~/.convoy/config.yaml; project config merges on top.
   Precedence: CLI flags > project config > global config > built-in defaults.

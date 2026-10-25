@@ -1,8 +1,21 @@
-import { resolveModel, type ModelGateway, type ModelRoutingOverrides } from "./model-routing"
+import { resolveModel, type ModelGateway, type ModelRoutingOverrides, type ResolvedModel } from "./model-routing"
 import type { OpenSpecBundle } from "./openspec"
 import type { PrdHistoryPreview } from "./prd-history"
-import { stepRunnerFor } from "./step-runners"
-import type { AgentStep, FeaturePlanLink, Pipeline, ResolvedGoalPlan, RunOptions, RunPlan, Step } from "./types"
+import { resolveBilling } from "./runners/billing"
+import type { AuthenticationMode, AuthenticationSelection } from "./runners/contracts"
+import { normalizeQualifiedModel, runnerDescriptor } from "./runners/descriptors"
+import {
+  defaultStepRunnerId,
+  modelOverrideTargetsRunner,
+  parseModelOverride,
+  qualifiedModelRoute,
+  runnerOfModelReference,
+  stepRunnerFor,
+  stepRunnerIds,
+  type ModelOverride,
+  type StepRunnerId,
+} from "./step-runners"
+import type { AgentStep, FeaturePlanLink, Pipeline, ResolvedGoalPlan, ReviewedRunnerAuth, RunOptions, RunPlan, Step } from "./types"
 
 export type BuildRunPlanInput = RunOptions & {
   promptSource?: RunPlan["prompt"]["source"]
@@ -21,6 +34,39 @@ export type BuildRunPlanInput = RunOptions & {
   feature?: FeaturePlanLink
 }
 
+/**
+ * The resolved auth mode per planned step on a runner that authenticates. A
+ * WeakMap keyed by the frozen step objects keeps the plan type vendor-neutral
+ * without adding fields to `AgentStep`; a step that was never annotated
+ * resolves to the documented `subscription` default.
+ */
+const stepAuthModes = new WeakMap<AgentStep, AuthenticationMode>()
+
+function registerStepAuth(pipeline: Pipeline, modes: Partial<Record<StepRunnerId, AuthenticationMode>>): void {
+  for (const step of planAgentSteps(pipeline)) {
+    const mode = modes[stepRunnerFor(step.runner).id]
+    if (mode) stepAuthModes.set(step, mode)
+  }
+}
+
+/** Only non-secret selection fields are frozen; the key stays in its variable. */
+function frozenSelection(selection: AuthenticationSelection | undefined): AuthenticationSelection {
+  if (!selection) return { mode: "subscription" }
+  return { mode: selection.mode, ...(selection.credentialRef ? { credentialRef: selection.credentialRef } : {}), ...(selection.billingPolicy ? { billingPolicy: selection.billingPolicy } : {}) }
+}
+
+/**
+ * Every runner that authenticates and that the plan uses: a step, an advisor,
+ * the judge, or the commit writer. Each one's billing decision is reviewed.
+ */
+export function planAuthenticatingRunners(pipeline: Pipeline, judge: RunPlan["smartJudge"], commitMessageModel: string | undefined): StepRunnerId[] {
+  const used = new Set<StepRunnerId>(pipelineRunners(pipeline))
+  for (const step of planAgentSteps(pipeline)) if (step.resolvedAdvisor) used.add(runnerOfModelReference(step.resolvedAdvisor))
+  if (judge?.runner) used.add(judge.runner)
+  if (commitMessageModel) used.add(runnerOfModelReference(commitMessageModel))
+  return stepRunnerIds.filter((id) => used.has(id) && runnerDescriptor(id).authenticates)
+}
+
 /** Purely resolves the complete execution shape; it performs no filesystem or process effects. */
 export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
   const gateway = input.gateway ?? "configured"
@@ -33,10 +79,17 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     advisorOverride: input.advisorOverride,
     advisorDisabled: input.advisorDisabled,
   })
-  const judge = input.smart
-    ? resolveModel(input.smartJudgeModel, gateway, overrides)
-    : undefined
+  const judge = input.smart ? resolveJudge(input.smartJudgeModel, gateway, overrides) : undefined
   const hooks = hooksForPlan(input, pipeline.name)
+  // Every CLI runner the plan uses gets a reviewed route. Neither CLI exposes a
+  // control that enforces included-only usage, so the billing decision is
+  // never claimed verified (design D3).
+  const runnerAuth: Partial<Record<StepRunnerId, ReviewedRunnerAuth>> = {}
+  for (const runner of planAuthenticatingRunners(pipeline, judge, input.commitMessageModel)) {
+    const auth = frozenSelection(input.runnerAuth?.[runner])
+    runnerAuth[runner] = { auth, billing: resolveBilling(auth, { canVerifyIncludedOnly: false }) }
+  }
+  registerStepAuth(pipeline, Object.fromEntries(Object.entries(input.runnerAuth ?? {}).map(([runner, auth]) => [runner, auth!.mode])))
   return deepFreeze({
     prompt: { source: input.promptSource ?? (input.resumeRunID ? "resume" : "inline"), text: input.prompt },
     target: {
@@ -49,7 +102,9 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     },
     pipeline,
     modelRouting: { gateway },
-    ...(judge ? { smartJudge: { model: judge } } : {}),
+    ...(judge ? { smartJudge: judge } : {}),
+    ...(Object.keys(runnerAuth).length > 0 ? { runnerAuth } : {}),
+    ...(input.commitMessageModel ? { commitMessageModel: input.commitMessageModel } : {}),
     hooks,
     attachments: [...input.files],
     ...(input.openspec ? { openspec: input.openspec } : {}),
@@ -70,6 +125,49 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
   })
 }
 
+/**
+ * The judge route: a runner-qualified route (`claude-code/<model>`,
+ * `codex/<model>`) judges through that runner's CLI and is never
+ * gateway-routed (the CLI's model id is opaque to OpenCode's catalog);
+ * anything else is an OpenCode model routed like a step's.
+ */
+function resolveJudge(configured: string, gateway: ModelGateway, overrides: ModelRoutingOverrides): NonNullable<RunPlan["smartJudge"]> {
+  const model = resolveRunnerQualifiedModel(configured, gateway, overrides, "helper")
+  const runner = runnerOfModelReference(model)
+  return runner === defaultStepRunnerId ? { model } : { runner, model }
+}
+
+/** Every agent step of the pipeline, goal fragments included. */
+export function planAgentSteps(pipeline: Pipeline): AgentStep[] {
+  const steps: Step[] = [...pipeline.steps, ...(pipeline.goalPlan ? [...pipeline.goalPlan.improve.steps, ...pipeline.goalPlan.measure.steps] : [])]
+  return steps.filter((step): step is AgentStep => step.type === "agent")
+}
+
+/** Every runner an agent step of the pipeline (goal fragments included) executes on. */
+export function pipelineRunners(pipeline: Pipeline): Set<StepRunnerId> {
+  return new Set(planAgentSteps(pipeline).map((step) => stepRunnerFor(step.runner).id))
+}
+
+/**
+ * The one CLI runner every agent step runs on, when there is exactly one: such
+ * a plan never needs OpenCode by default, so its judge and helpers inherit it.
+ */
+export function soleCliRunner(pipeline: Pipeline): StepRunnerId | undefined {
+  const runners = [...pipelineRunners(pipeline)]
+  return runners.length === 1 && stepRunnerFor(runners[0]).qualifiedModels ? runners[0] : undefined
+}
+
+/**
+ * The runner-qualified default helper route for a CLI runner
+ * (`claude-code/haiku`, `codex/default#low`); `default` keeps the CLI's own
+ * model.
+ */
+export function defaultHelperRoute(runner: StepRunnerId, model?: string): string {
+  const fallback = runnerDescriptor(runner).helperModel
+  const chosen = model ? { model } : (fallback ?? { model: "" })
+  return `${runner}/${chosen.model || "default"}${"variant" in chosen && chosen.variant ? `#${chosen.variant}` : ""}`
+}
+
 export type AdvisorPlanOverrides = {
   /** Forces this advising model on every advisor-capable step. Empty leaves each step's own resolution alone. */
   advisorOverride?: string
@@ -84,17 +182,18 @@ export function routePipeline(
   modelOverride = "",
   advisor: AdvisorPlanOverrides = {},
 ): Pipeline {
+  const override = parseModelOverride(modelOverride)
   return {
     ...pipeline,
-    steps: pipeline.steps.map((step): Step => routeStep(step, gateway, overrides, modelOverride, advisor)),
+    steps: pipeline.steps.map((step): Step => routeStep(step, gateway, overrides, override, advisor)),
     // The goal fragments are frozen with the plan: their models and advisors
     // route exactly once, so every iteration runs the reviewed models.
     ...(pipeline.goalPlan
       ? {
           goalPlan: {
             ...pipeline.goalPlan,
-            improve: { steps: pipeline.goalPlan.improve.steps.map((step) => routeStep(step, gateway, overrides, modelOverride, advisor) as AgentStep) },
-            measure: { steps: pipeline.goalPlan.measure.steps.map((step) => routeStep(step, gateway, overrides, modelOverride, advisor) as AgentStep) },
+            improve: { steps: pipeline.goalPlan.improve.steps.map((step) => routeStep(step, gateway, overrides, override, advisor) as AgentStep) },
+            measure: { steps: pipeline.goalPlan.measure.steps.map((step) => routeStep(step, gateway, overrides, override, advisor) as AgentStep) },
           },
         }
       : {}),
@@ -105,11 +204,26 @@ function routeStep(
   step: Step,
   gateway: ModelGateway,
   overrides: ModelRoutingOverrides,
-  modelOverride: string,
+  override: ModelOverride,
   advisor: AdvisorPlanOverrides,
 ): Step {
-  if (step.type !== "agent" || stepRunnerFor(step.runner).id !== "opencode") return structuredClone(step)
-  const configured = modelOverride || `${step.model}${step.variant ? `#${step.variant}` : ""}`
+  if (step.type !== "agent") return structuredClone(step)
+  const runner = stepRunnerFor(step.runner)
+  if (runner.qualifiedModels) {
+    // A CLI runner's model identifier is opaque to the gateway router; only an
+    // override scoped to that runner replaces it. An unqualified override is
+    // for provider-qualified runners and leaves CLI steps untouched (design
+    // D5). Its advisor routes like any other step's.
+    const routed = { ...structuredClone(step), ...routeAdvisor(step, gateway, overrides, advisor) }
+    if (!modelOverrideTargetsRunner(override, runner.id)) return routed
+    const selected = normalizeQualifiedModel(runner.id, override.model)
+    return { ...routed, model: selected.model, variant: selected.variant }
+  }
+  // A runner-scoped override that names another runner does not replace the
+  // OpenCode model; the step still routes its own configured model normally.
+  const configured = modelOverrideTargetsRunner(override, runner.id)
+    ? override.model
+    : `${step.model}${step.variant ? `#${step.variant}` : ""}`
   const resolvedModel = resolveModel(configured, gateway, overrides)
   return {
     ...step,
@@ -137,12 +251,31 @@ function routeAdvisor(
   const configured = advisorOverride || (step.advisor ? `${step.advisor}${step.advisorVariant ? `#${step.advisorVariant}` : ""}` : "")
   if (!configured) return off
 
-  const resolvedAdvisor = resolveModel(configured, gateway, overrides)
+  const resolvedAdvisor = resolveRunnerQualifiedModel(configured, gateway, overrides)
   return {
     advisor: `${resolvedAdvisor.providerID}/${resolvedAdvisor.modelID}`,
     advisorVariant: resolvedAdvisor.variant,
     resolvedAdvisor,
   }
+}
+
+/**
+ * A helper model reference (advisor, judge): a runner-qualified route
+ * (`claude-code/<model>`, `codex/<model>[#effort]`) runs on that runner's CLI
+ * and is never gateway-routed, since its model id is opaque to OpenCode's
+ * catalog; anything else is an OpenCode model routed like a step's. An empty
+ * model takes the runner's default for the purpose.
+ */
+export function resolveRunnerQualifiedModel(configured: string, gateway: ModelGateway, overrides: ModelRoutingOverrides, purpose: "advisor" | "helper" = "advisor"): ResolvedModel {
+  const route = qualifiedModelRoute(configured)
+  if (!route) return resolveModel(configured, gateway, overrides)
+  const fallback = purpose === "helper" ? runnerDescriptor(route.runner).helperModel : runnerDescriptor(route.runner).advisorModel
+  const named = route.model && route.model !== "default" ? route.model : undefined
+  const variant = route.variant ?? (named ? undefined : fallback?.variant)
+  const selected = normalizeQualifiedModel(route.runner, `${named ?? fallback?.model ?? ""}${variant ? `#${variant}` : ""}`)
+  const modelID = selected.model || "default"
+  const target = `${route.runner}/${modelID}${selected.variant ? `#${selected.variant}` : ""}`
+  return { configured, logical: modelID, gateway: "configured", providerID: route.runner, modelID, ...(selected.variant ? { variant: selected.variant } : {}), target }
 }
 
 function filterPipeline(pipeline: Pipeline, only: string[], skip: string[]): Pipeline {
@@ -170,8 +303,21 @@ function deepFreeze<T>(value: T): T {
   return value
 }
 
+/**
+ * The reviewed auth mode for a step on a runner that authenticates. OpenCode
+ * uses its own provider credentials and reports `undefined`.
+ */
+export function plannedStepAuthMode(step: AgentStep): AuthenticationMode | undefined {
+  if (!runnerDescriptor(stepRunnerFor(step.runner).id).authenticates) return undefined
+  return stepAuthModes.get(step) ?? "subscription"
+}
+
 export function plannedStepModel(step: AgentStep): string {
-  if (step.runner === "claude-code") return `claude-code/${step.model || "default"}`
+  const runner = stepRunnerFor(step.runner)
+  if (runner.qualifiedModels) {
+    const auth = plannedStepAuthMode(step)
+    return `${runner.modelLabel(step.model, step.variant)}${auth ? ` · auth ${auth}` : ""}`
+  }
   return step.resolvedModel?.target ?? `${step.model}${step.variant ? `#${step.variant}` : ""}`
 }
 
@@ -195,7 +341,7 @@ export function throughputRoutedModels(
   // the selected gateway rejects the parent plan before any phase starts, even
   // when it would only run in a later iteration.
   for (const step of [...pipeline.steps, ...(pipeline.goalPlan ? [...pipeline.goalPlan.improve.steps, ...pipeline.goalPlan.measure.steps] : [])]) {
-    if (step.type !== "agent" || stepRunnerFor(step.runner).id !== "opencode") continue
+    if (step.type !== "agent" || stepRunnerFor(step.runner).qualifiedModels) continue
     add(step.resolvedModel)
     add(step.resolvedAdvisor)
   }

@@ -5,8 +5,9 @@ import { defaultAdvisorMaxCalls } from "./advisor"
 import { gatewayLabel } from "./model-routing"
 import { prdHistoryPreviewCopy } from "./prd-history"
 import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
-import { stepRunnerFor } from "./step-runners"
-import type { RunPlan } from "./types"
+import { stepRunnerFor, stepRunnerIds, type StepRunnerId } from "./step-runners"
+import { runnerDescriptor } from "./runners/descriptors"
+import type { ReviewedRunnerAuth, RunPlan } from "./types"
 
 const controlCharacters = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g
 const ansiSequences = /\u001b\[[0-?]*[ -/]*[@-~]/g
@@ -83,6 +84,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     }
     lines.push(`Runtime: ${plan.permissions} permissions · ${plan.attachments.length} attachments`)
     if (plan.smartJudge) lines.push(`  Judge: ${sanitizeInline(plan.smartJudge.model.target)}`)
+    for (const [runner, reviewed] of reviewedRunnerRoutes(plan)) lines.push(`  ${runnerDescriptor(runner).displayName}: ${runnerRouteSummary(reviewed)}`)
   }
   return `${lines.join("\n")}\n`
 }
@@ -151,3 +153,30 @@ export function sanitizeReviewText(value: string) {
 export function sanitizeReviewInline(value: string) {
   return sanitizeInline(value)
 }
+
+/** The reviewed CLI-runner routes of a plan, in registry order. */
+export function reviewedRunnerRoutes(plan: RunPlan): [StepRunnerId, ReviewedRunnerAuth][] {
+  return stepRunnerIds.flatMap((runner) => {
+    const reviewed = plan.runnerAuth?.[runner]
+    return reviewed ? [[runner, reviewed] as [StepRunnerId, ReviewedRunnerAuth]] : []
+  })
+}
+
+/**
+ * A CLI runner's authentication and billing, as the operator accepts it by
+ * confirming the plan: subscription login is not a no-charge guarantee, so
+ * the review always says whether usage credits may apply.
+ */
+export function runnerRouteSummary(reviewed: ReviewedRunnerAuth): string {
+  const auth = reviewed.auth.mode === "api-key" ? `api-key (${reviewed.auth.credentialRef ?? "unset"})` : "subscription"
+  const billing =
+    reviewed.auth.mode === "api-key"
+      ? "billed to the API account"
+      : reviewed.billing.policy === "included-only" && !reviewed.billing.includedOnlyVerifiable
+        ? "included-only requested but not verifiable — preflight refuses it"
+        : "account policy — usage credits or paid features may apply"
+  return `${auth} · ${billing}`
+}
+
+/** The historical name of {@link runnerRouteSummary}. */
+export const claudeRouteSummary = runnerRouteSummary

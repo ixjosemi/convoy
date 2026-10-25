@@ -66,13 +66,14 @@ convoy --resume 20260519-103045-x7q2
 # phases of the existing run, [s]ummary/reports overlay, subshell in the run
 # [d]ir under ~/.convoy/runs (exit to return), [q]uit.
 # Pass a run ID to open the browser with that run preselected.
-# Without a TTY (pipes/CI) it falls back to a plain listing.
+# Without a TTY (pipes/CI) it prints plain text: the listing, or for a run ID
+# that run's "run <id>: <status>" line, its phases, and its summary.
 convoy runs
 convoy runs 20260519-103045-x7q2
 
-# view and edit the global (~/.convoy) and current project config in a TUI:
-# two tabs (Global / Project), pick models with autocomplete, edit pipelines
-# and steps, or initialize a starter config when none exists.
+# toggle the worktrees and specs features for this project, list the global
+# (~/.convoy) and project config files, see whether each one loads, and open
+# one in $EDITOR (a missing config is created from the template)
 convoy config
 
 # create project-local config and prompt files you can customize
@@ -102,7 +103,7 @@ convoy --prompt-file prd.md --base develop
 convoy --prompt-file prd.md --include-dirty
 ```
 
-In interactive terminals, Convoy shows a full-screen OpenTUI dashboard headed by a compact run summary (clock, elapsed, cost, tokens). The `pipeline` panel on the left is a tab selector: every step — done, running, or still scheduled — is a row you move through with `↑`/`↓` (or `j`/`k`), or by clicking, with `▸` marking the focused one. Focusing a step drives the whole right side to it: a detail panel (name; whether it's ongoing, done, failed, or scheduled; model; cost; tokens; attempt; files changed) over that step's todo list and a three-tab content panel — switched with `←`/`→`, `Tab`, the number keys `1`/`2`/`3`, or by clicking the tab strip. The tabs are `logs` (the step's color-coded activity feed), `reports` (the markdown report that step wrote, if any, scrollable with `PgUp`/`PgDn` — available live the moment a step finishes, not only at the end), and `session` (a read-only "follow along" view of that step's OpenCode session: its live state — reasoning, running a command, editing, applying a diff — model, attempt, cost, diff summary, and a scrolling transcript of what the model is doing, newest at the bottom). A not-yet-started step reads as `scheduled` with its planned model and zeroed usage, so you can inspect what's coming; focus auto-follows the active step until you navigate, and `Esc` hands it back to auto-follow. The dashboard never paints backgrounds: the canvas is your terminal's own background and panels are delineated by borders alone, derived as subtle elevations of the terminal's reported background color, with dark or light accents picked by its brightness (and a neutral fallback when the terminal doesn't answer); floating modals repaint the reported color exactly to mask the content beneath them. It follows live theme changes. For full interactivity, press `o` (or click the detail panel) to open the focused step's OpenCode session in a new terminal window attached to Convoy's running OpenCode server; clicking a pipeline row only focuses that step — it no longer opens the session. Inside Herdr or Zellij that session opens in a sibling pane instead (see below); otherwise Ghostty is preferred when installed and Terminal.app is the fallback (`CONVOY_TERMINAL=herdr|zellij|ghostty|terminal` forces a backend). Press `Shift+Tab` to cycle auto-accept modes — off, auto-accept, smart (see the permission gate below). Press `Ctrl+C` once to abort the active OpenCode session and shut down Convoy cleanly; press it again to force-stop the owned OpenCode server (SIGKILL) and exit within a bounded second instead of leaving it behind. Human gates stay inside the dashboard (`c` continue · `o` open OpenCode · `a` abort); without a TTY dashboard they fall back to plain terminal prompts. A step that fails now waits for you instead of retrying: the dashboard shows a `step failed` gate with `r` retry clean (restore the baseline and run again), `o` open the OpenCode session and fix it by hand, `a` abort — no auto-retry, no lost work. Once you open the session (`o`), the gate becomes the interactive one and `c` unlocks; `c` delivers the step's report (including one written in the reopened session), and without any valid report it re-opens the gate instead of advancing to the next step. Use `--no-tui` to fall back to plain logs.
+In interactive terminals, Convoy shows a full-screen OpenTUI dashboard headed by a compact run summary (clock, elapsed, cost, tokens). The `pipeline` panel on the left is a tab selector: every step — done, running, or still scheduled — is a row you move through with `↑`/`↓` (or `j`/`k`), or by clicking, with `▸` marking the focused one. Focusing a step drives the whole right side to it: a detail panel (name; whether it's ongoing, done, failed, or scheduled; model; cost; tokens; attempt; files changed) over that step's todo list and a three-tab content panel — switched with `←`/`→`, `Tab`, the number keys `1`/`2`/`3`, or by clicking the tab strip. The tabs are `logs` (the step's color-coded activity feed), `reports` (the markdown report that step wrote, if any, scrollable with `PgUp`/`PgDn` — available live the moment a step finishes, not only at the end), and `session` (a read-only "follow along" view of that step's OpenCode session: its live state — reasoning, running a command, editing, applying a diff — model, attempt, cost, diff summary, and a scrolling transcript of what the model is doing, newest at the bottom). A not-yet-started step reads as `scheduled` with its planned model and zeroed usage, so you can inspect what's coming; focus auto-follows the active step until you navigate, and `Esc` hands it back to auto-follow. The dashboard never paints backgrounds: the canvas is your terminal's own background and panels are delineated by borders alone, derived as subtle elevations of the terminal's reported background color, with dark or light accents picked by its brightness (and a neutral fallback when the terminal doesn't answer); floating modals repaint the reported color exactly to mask the content beneath them. It follows live theme changes. For full interactivity, press `o` (or click the detail panel) to open the focused step's OpenCode session in a new terminal window attached to Convoy's running OpenCode server; clicking a pipeline row only focuses that step — it no longer opens the session. Inside Herdr or Zellij that session opens in a sibling pane instead (see below); otherwise Ghostty is preferred when installed and Terminal.app is the fallback (`CONVOY_TERMINAL=herdr|zellij|ghostty|terminal` forces a backend). Press `Shift+Tab` to cycle auto-accept modes — off, auto-accept, smart (see the permission gate below). Press `Ctrl+C` once to abort the active OpenCode session and shut down Convoy cleanly; press it again to force-stop the owned OpenCode server (SIGKILL) and exit within a bounded second instead of leaving it behind. Human gates stay inside the dashboard (`c` continue · `o` open OpenCode · `a` abort); without a TTY dashboard they fall back to plain terminal prompts. With human steps on, a step that fails waits for you instead of retrying (an unattended run, with them off, fails the step instead): the dashboard shows a `step failed` gate with `r` retry clean (restore the baseline and run again), `o` open the OpenCode session and fix it by hand, `a` abort — no auto-retry, no lost work. Once you open the session (`o`), the gate becomes the interactive one and `c` unlocks; `c` delivers the step's report (including one written in the reopened session), and without any valid report it re-opens the gate instead of advancing to the next step. Use `--no-tui` to fall back to plain logs.
 
 When Convoy runs inside Herdr or Zellij (including over SSH), `o` and `i` open OpenCode in a focused sibling pane rather than a macOS window, named for what it holds (`opencode session`, `opencode iterate`, `claude session`). Inside Herdr the pane splits the current one to the right; inside Zellij it is a new pane. The pane opens in your own login shell — with your prompt and configuration, so the client resolves the same `opencode` your shell would — and Convoy waits for that shell to settle before typing the command. The multiplexer's normal focus shortcut returns to Convoy without closing the pane. When OpenCode exits the pane deliberately stays, now back at your normal interactive shell, so a session that failed to start is readable instead of vanishing; press `Ctrl+C` there to close the pane, or `Enter` to run it again. Set `CONVOY_TERMINAL=herdr`, `zellij`, `ghostty`, or `terminal` to override automatic backend selection — any other value is rejected with an error rather than silently ignored. When both multiplexers are detected, Herdr wins because the session runs inside it — and a failed Herdr open never falls through to Zellij, which would talk to the outer session and hang or open a pane you cannot see. If Convoy is inside a multiplexer but can't find its binary on its own `PATH`, it falls back to a macOS window rather than losing session opening altogether.
 
@@ -166,11 +167,48 @@ Each invocation creates `~/.convoy/runs/<run-id>/`:
 
 `metadata.json` records the resolved pipeline the run executes plus each step's status, session ID, timing, cost, tokens, and model as the run progresses (written atomically, debounced). On `--resume`, the frozen pipeline is replayed — even if `.convoy/config.yaml` changed since — and steps that already wrote their report are restored in the dashboard with their real duration, cost, and session, which can still be opened by clicking the pipeline row.
 
+Each `<step>.pre.diff` is the working tree measured from where the branch forked off the base (its merge base), so commits that landed on the base afterwards stay out of it. When there is no merge base (unrelated history, or a shallow clone that lacks the fork point), Convoy warns and compares against the base itself, as before. A diff over 1 MB is not attached whole: the step gets `<step>.pre.overview.md` instead, itself kept under 1 MB, which inlines the per-file diffs that fit (smallest first), lists as many omitted files as fit with their sizes (counting the rest), and points to the full diff for the agent to read.
+
 `SUMMARY.md` is the mechanical archive — every phase report concatenated — while `reports/run-report.md` (on the `implement` pipelines) is the one-page extractive distillation written for a human to read first. Read the recap, then open the full archive only where it points you.
 
 The run dir is kept after the run by default (browse it with `convoy runs`); pass `--no-keep-run-dir` to delete it on successful completion. If the run fails, it's always preserved for inspecting reports, diffs, and logs.
 
 The target repo only sees commits with prefix `convoy(<phase>): ...`, made on the run's branch — by default a new one in its own worktree, so your checkout is untouched until you merge. When a run completes, its commits compact automatically into one conventional commit of your own (see [Finishing a run](safety.md#finishing-a-run)). Each new run also stores a git-ignored, private copy of its prompt under `.convoy/prd-history/`; set `defaults.prdHistory: false` to disable it. `convoy init` intentionally creates `.convoy/config.yaml` when you want project-local configuration.
+
+## Driving Convoy from a script or agent
+
+Off a terminal, a launch is a command a script or agent can supervise. It either blocks until the run ends, or with `--detach` returns as soon as the run is up:
+
+```bash
+# blocking: stream the run's log and exit with its code
+convoy --pipeline review --manual --no-confirm --smart "Audit the payment flow" < /dev/null
+
+# detached: start, print the run id, return; then poll
+convoy --pipeline review --manual --smart --detach "Audit the payment flow" < /dev/null
+convoy runs <run-id> --wait --timeout 5m
+```
+
+- A blocking launch prints the compact plan, then `coordinator <pid> running run <id>; logs: <path>`, streams the run's log (`[step] attempt …`, `[step] session: …`, `[step] usage: $…`, permission decisions) for OpenCode and Claude steps alike, and **exits with the run's own code**: 0 on success, non-zero on a failed step, 130 on abort.
+- `--detach` prints the plan, then `run <id> started (coordinator <pid>, detached)` with the log path, and exits 0 while the run keeps going in the background. It implies `--no-tui`, `--no-confirm`, and no human steps. Use it from agent sessions, whose shell tools time out long before a run ends.
+- Pass `--change <id>` or `--manual`, and `--smart` or `--yolo`. With interactive permissions a request is never auto-rejected: it holds until someone answers it, logged as `[permission] waiting for an answer: …`, and the launch warns about this before it starts.
+- Human steps are off by default without a TTY (`--no-human-step`), and so are the decisions after a failure: a failed step fails the run instead of waiting at its failure gate. Resume it later with `--resume <id>`.
+- `--pipeline-file <path>` runs a pipeline defined in its own YAML file, so a script or agent can compose one without editing your config (see [Pipeline files](pipelines.md#pipeline-files)). `convoy pipelines` lists what can run.
+
+### Following a run
+
+| Command | What it does |
+|---|---|
+| `convoy runs <id>` | Off a terminal: the run's status line (`running`, `running · waiting for a permission`, `completed`, `failed …`), its phases with model and cost, and its summary |
+| `convoy runs <id> --json` | The same as data: `state` (`running`, `waiting`, `completed`, `failed`, `incomplete`, `unknown`), `phases`, `cost`, `waiting` (the pending request), `goal`, `summaryPath`, `reports`, `logPath`, `targetDir` |
+| `convoy runs --json` | The run history as data |
+| `convoy runs <id> --wait [--timeout 5m]` | Blocks until the run ends, stops at a gate, or the timeout passes, printing phase changes as they happen (`--json` prints one snapshot at the end instead) |
+| `convoy runs <id> approve <request> [--always]` | Allows the pending permission request once, or for the rest of the run |
+| `convoy runs <id> deny <request>` | Rejects it |
+| `convoy runs <id> abort` | Stops the run; it stays resumable |
+
+`--wait` exits **0** when the run completed, **1** when it ended any other way, **2** when the timeout passed with the run still going, and **3** when the run waits for an answer. Approve and deny name the request they answer (`waiting.requestId` in `--json`, also printed by `--wait`), so nothing approves a request its caller hasn't seen; they act as the run's controller for that one request and refuse while a dashboard is attached. The `logPath` is the detached coordinator's log, available while the run is live.
+
+To have a Claude Code, OpenCode, or Codex session do all of this itself, install the [agent skill](agents.md).
 
 ## Reviewing a run before starting
 

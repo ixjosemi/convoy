@@ -1,4 +1,5 @@
-import { normalizeStepRunnerModel, stepRunnerFor } from "./step-runners"
+import { defaultStepRunnerId, explicitRunnerOf, normalizeStepRunnerModel, stepRunnerCapabilityReason, stepRunnerFor, type StepRunnerDefinition, type StepRunnerId } from "./step-runners"
+import { qualifiedRunnerOf } from "./runners/descriptors"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import type { AgentSpec, AgentStep, DeliverableContract, HumanStep, Pipeline, ResolvedGoalPlan, ResolvedPipelineFragment, Step, StepRunner } from "./types"
 
@@ -12,16 +13,22 @@ const fallbackModel = `${defaultGptModel}#${defaultGptVariant}`
 const glm53HighModel = "openrouter/z-ai/glm-5.3#high"
 /** Opus reached through OpenRouter for shared agent defaults and hunter audits. */
 const opusViaOpenRouter = "openrouter/anthropic/claude-opus-5"
-/** Grok 4.6 high: the review and ship scoring, plus one hunter audit track. */
+/** Grok 4.6 high: the ship scoring, plus one hunter audit track. */
 const grokModel = "openrouter/x-ai/grok-4.6#high"
 const kimiModel = "openrouter/moonshotai/kimi-k3"
 /** DeepSeek V4.1 Flash on OpenRouter: the writer for `implement`, review's report, and the goal fixers. */
 const deepseekModel = "openrouter/deepseek/deepseek-v4.1-flash"
 /** DeepSeek V4.1 Flash on OpenRouter with reasoning raised: used for writing, flash audits and run recaps. */
 const deepseekHighModel = `${deepseekModel}#high`
+/** DeepSeek V4.1 Flash 1017 (the October 17 refresh): review's scoping, audit, and report leg. */
+const deepseek1017Model = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+const deepseek1017HighModel = `${deepseek1017Model}#high`
 /** GPT 5.6 Sol: the hunter pipeline's consensus reporter at xhigh. */
 const solModel = "openai/gpt-5.6-sol"
 const solXhighModel = `${solModel}#xhigh`
+/** GPT 6.1 Sol: near-Astra quality at a fifth of the price; review's OpenAI audit and scorer legs. */
+const sol61HighModel = "openai/gpt-6.1-sol#high"
+const sol61XhighModel = "openai/gpt-6.1-sol#xhigh"
 /** GLM 5.3 Flash with reasoning raised: the security and design model for the implementation pipelines. */
 const glm53FlashHighModel = "openrouter/z-ai/glm-5.3-flash#high"
 /** GPT 6 Astra at extra high: the advisor the goal pipelines and the fixer consult where Grok or Sol used to advise. */
@@ -348,7 +355,11 @@ export type AgentStepSpec = {
   model?: string
   /** Fans this step out into one concurrent, forced-read-only invocation per model. Mutually exclusive with `model`. */
   models?: string[]
-  /** Execution engine. Default is OpenCode; "claude-code" spawns the local `claude` CLI (read-only audit steps only). */
+  /**
+   * Execution engine. Default is OpenCode (or defaults.runner); "claude-code"
+   * spawns the local `claude` CLI under Convoy's hook-enforced policy, and
+   * "codex" an owned `codex app-server` whose every action Convoy approves.
+   */
   runner?: "opencode" | StepRunner
   /**
    * Advising model consulted at this step's decision points, or `false` to run
@@ -517,28 +528,86 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       },
     ],
   },
-  // Report-only audits on two flash models, followed by independent scoring.
+  // Report-only audits: one cheap DeepSeek leg and one strong OpenAI leg per
+  // track, then independent scoring across OpenAI and GLM.
   review: {
     description:
-      "Report-only PR review on ultra-cheap models: scope, parallel audits (DeepSeek V4.1 Flash + GLM 5.3 Flash) and report on flash models; the scoring uses GLM 5.3 high + Grok 4.6 high and the score consensus stays on GLM 5.3 high. Makes no changes.",
+      "Report-only PR review: scope, parallel audits (DeepSeek V4.1 Flash 1017 + GPT-6.1 Sol) and report on DeepSeek 1017; the scoring uses GPT-6.1 Sol xhigh + GLM 5.3 high and the score consensus stays on GLM 5.3 high. Makes no changes.",
     defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
     suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
-      { agent: "review-scope", name: "scope", model: deepseekHighModel, reports: "none", diff: true, verify: true, prdHistory: true },
+      { agent: "review-scope", name: "scope", model: deepseek1017HighModel, reports: "none", diff: true, verify: true, prdHistory: true },
       {
         parallel: [
-          { agent: "clean-code-auditor", name: "clean-code", models: [deepseekHighModel, glm53FlashHighModel], reports: ["scope"] },
-          { agent: "security-reviewer", name: "security", models: [deepseekHighModel, glm53FlashHighModel], reports: ["scope"] },
-          { agent: "bug-auditor", name: "bugs", models: [deepseekHighModel, glm53FlashHighModel], reports: ["scope"] },
+          { agent: "clean-code-auditor", name: "clean-code", models: [deepseek1017HighModel, sol61HighModel], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", models: [deepseek1017HighModel, sol61HighModel], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", models: [deepseek1017HighModel, sol61HighModel], reports: ["scope"] },
         ],
       },
-      { agent: "review-report", name: "report", model: deepseekHighModel, reports: "all" },
+      { agent: "review-report", name: "report", model: deepseek1017HighModel, reports: "all" },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [glm53HighModel, grokModel], reports: "all", prdHistory: true },
+          { agent: "quality-scorer", name: "score", models: [sol61XhighModel, glm53HighModel], reports: "all", prdHistory: true },
         ],
       },
       { agent: "quality-score-report", name: "score-report", model: glm53HighModel, reports: "all", verify: true, prdHistory: true },
+    ],
+  },
+  // Claude-only preset: every step runs the local `claude` CLI on subscription
+  // auth by default, so no OpenCode installation, server, model, or provider
+  // credential is needed — the judge and helpers follow the plan to Claude.
+  // The audits fan out across Claude aliases through the same scheduler as any
+  // other pipeline. Report-only, so it never writes; the verifying scope step
+  // runs its checks under Convoy's hook-enforced command policy. Copy it into
+  // `.convoy/config.yaml` and adjust the model aliases (or set an explicit
+  // `authMode: api-key` route) to match the installation.
+  "claude-review": {
+    description:
+      "Claude-only report: scope the diff, fan clean-code/security/bug audits across Claude models, then synthesize one prioritized findings report. Makes no changes.",
+    defaultPrompt: "Review the current branch with Claude only and report prioritized findings.",
+    suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
+    steps: [
+      { agent: "review-scope", name: "scope", runner: "claude-code", model: "sonnet", reports: "none", diff: true, verify: true, prdHistory: true },
+      {
+        parallel: [
+          { agent: "clean-code-auditor", name: "clean-code", runner: "claude-code", models: ["opus", "sonnet"], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", runner: "claude-code", models: ["opus", "sonnet"], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", runner: "claude-code", models: ["opus", "sonnet"], reports: ["scope"] },
+        ],
+      },
+      { agent: "review-report", name: "report", runner: "claude-code", model: "opus", reports: "all" },
+    ],
+  },
+  // Claude-only full cycle: the full-cycle shape — advised implementation,
+  // audits, tests, then a terminal goal loop scored by two Claude models and a
+  // verified consensus — on the local `claude` CLI alone. The writers consult
+  // an Opus advisor through Convoy's MCP tools and first-write checkpoint;
+  // reports and scores go through write_report exactly as on OpenCode.
+  "claude-full-cycle": {
+    description:
+      "Claude-only full cycle: Sonnet implements and fixes advised by Opus, audits and tests run on Sonnet, then Opus and Sonnet score with a verified Opus consensus; fix gaps up to five times to reach 90/100.",
+    steps: [
+      { agent: "implementer", runner: "claude-code", model: "sonnet", advisor: "claude-code/opus", reports: "none" },
+      { agent: "patterns", runner: "claude-code", model: "sonnet", advisor: false },
+      { agent: "security", runner: "claude-code", model: "sonnet", advisor: false },
+      { agent: "design", runner: "claude-code", model: "sonnet", advisor: false },
+      { agent: "tests", runner: "claude-code", model: "sonnet", advisor: false, reports: "none" },
+      {
+        goal: {
+          target: 90,
+          maxIterations: 5,
+          improve: {
+            briefStep: "fix",
+            steps: [{ agent: "goal-fixer", name: "fix", runner: "claude-code", model: "sonnet", advisor: "claude-code/opus", reports: "none", diff: true, prdHistory: true }],
+          },
+          measure: {
+            steps: [
+              { parallel: [{ agent: "quality-scorer", name: "score", runner: "claude-code", models: ["opus", "sonnet"], reports: "none", diff: true, prdHistory: true }] },
+              { agent: "quality-score-report", name: "score-report", runner: "claude-code", model: "opus", reports: ["score"], verify: true, diff: true, prdHistory: true },
+            ],
+          },
+        },
+      },
     ],
   },
   // The close of the process: the branch is synced with its base, reviewed and
@@ -689,6 +758,8 @@ export type ResolvePipelineInput = {
   defaultAdvisor?: string
   /** Project-wide defaults.advisorMaxCalls; loses to the step's own. */
   defaultAdvisorMaxCalls?: number
+  /** Project-wide defaults.runner: the runner of every step that names none. */
+  defaultRunner?: StepRunnerId
 }
 
 /**
@@ -712,7 +783,6 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
   const names = new Set<string>()
   let legacyHumanCount = 0
   let genericHumanCount = 0
-  const mixedVerify = mixedVerifyAgents(input.spec.steps, input.agents)
 
   // The terminal goal node: at most one, and only ever the pipeline's final
   // entry. Everything before it is the ordinary prefix.
@@ -727,6 +797,13 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
   }
   const goalSpec: GoalStepSpec | undefined = goalIndex === -1 ? undefined : (input.spec.steps[goalIndex] as GoalStepSpec)
   const ordinarySteps = goalSpec ? input.spec.steps.filter((_, index) => index !== goalIndex) : input.spec.steps
+  // OpenCode registers one agent config per name for the whole run, goal
+  // fragments included, so a mixed verifying/non-verifying use is detected
+  // across the prefix and both fragments.
+  const mixedVerify = mixedVerifyAgents(
+    [...ordinarySteps, ...(goalSpec ? [...goalSpec.goal.improve.steps, ...goalSpec.goal.measure.steps] : [])],
+    input.agents,
+  )
 
   const claimAgentName = (name: string, position: string) => {
     if (name === humanReviewStep || name.startsWith(`${humanReviewStep}-`)) {
@@ -819,7 +896,7 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
     throw new Error(`pipeline "${input.name}" has no agent steps`)
   }
 
-  const goalPlan = goalSpec ? resolveGoalStep(input, goalSpec.goal) : undefined
+  const goalPlan = goalSpec ? resolveGoalStep(input, goalSpec.goal, mixedVerify) : undefined
 
   return {
     name: input.name,
@@ -838,7 +915,7 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
  * never reserved agent or step names — so a custom goal pipeline needs no
  * `goal-fixer`, `score-report`, or `goal-fix` name anywhere.
  */
-function resolveGoalStep(input: ResolvePipelineInput, goal: GoalStepSpec["goal"]): ResolvedGoalPlan {
+function resolveGoalStep(input: ResolvePipelineInput, goal: GoalStepSpec["goal"], mixedVerify: ReadonlySet<string>): ResolvedGoalPlan {
   if (typeof goal.target !== "number" || !Number.isInteger(goal.target) || goal.target < 1 || goal.target > 100) {
     throw new Error(`pipeline "${input.name}": goal.target must be an integer from 1 through 100`)
   }
@@ -851,8 +928,8 @@ function resolveGoalStep(input: ResolvePipelineInput, goal: GoalStepSpec["goal"]
     throw new Error(`pipeline "${input.name}": goal.plateau must be a positive integer (got ${JSON.stringify(goal.plateau)})`)
   }
 
-  const improve = resolveFragment(input, "goal.improve", "improve", goal.improve.steps)
-  const measure = resolveFragment(input, "goal.measure", "measure", goal.measure.steps)
+  const improve = resolveFragment(input, "goal.improve", "improve", goal.improve.steps, mixedVerify)
+  const measure = resolveFragment(input, "goal.measure", "measure", goal.measure.steps, mixedVerify)
 
   if (improve.length === 0) {
     throw new Error(`pipeline "${input.name}": goal.improve.steps must be a non-empty list`)
@@ -917,6 +994,7 @@ function resolveFragment(
   label: string,
   groupIdPrefix: string,
   rawSteps: readonly StepSpec[],
+  mixedVerify: ReadonlySet<string>,
 ): AgentStep[] {
   const fragmentInput: ResolveStepInput = {
     name: input.name,
@@ -924,6 +1002,7 @@ function resolveFragment(
     ...(input.defaultModel !== undefined ? { defaultModel: input.defaultModel } : {}),
     ...(input.defaultAdvisor !== undefined ? { defaultAdvisor: input.defaultAdvisor } : {}),
     ...(input.defaultAdvisorMaxCalls !== undefined ? { defaultAdvisorMaxCalls: input.defaultAdvisorMaxCalls } : {}),
+    ...(input.defaultRunner !== undefined ? { defaultRunner: input.defaultRunner } : {}),
   }
   const names = new Set<string>()
   const claimName = (name: string, position: string) => {
@@ -976,7 +1055,7 @@ function resolveFragment(
           forcedReadOnly: true,
           priorSteps: steps,
           claimName,
-          mixedVerify: mixedVerifyAgents(rawSteps, input.agents),
+          mixedVerify,
         }),
       )
       steps.push(...members)
@@ -991,7 +1070,7 @@ function resolveFragment(
       forcedReadOnly: Boolean(spec.models && spec.models.length > 0),
       priorSteps: steps,
       claimName,
-      mixedVerify: mixedVerifyAgents(rawSteps, input.agents),
+      mixedVerify,
     })
     steps.push(...members)
   }
@@ -1026,7 +1105,7 @@ function asHumanStepSpec(raw: StepSpec): HumanStepSpec | LegacyHumanStepSpec | u
   return undefined
 }
 
-type ResolveStepInput = Pick<ResolvePipelineInput, "name" | "agents" | "defaultModel" | "defaultAdvisor" | "defaultAdvisorMaxCalls">
+type ResolveStepInput = Pick<ResolvePipelineInput, "name" | "agents" | "defaultModel" | "defaultAdvisor" | "defaultAdvisorMaxCalls" | "defaultRunner">
 
 type ResolveStepContext = {
   input: ResolveStepInput
@@ -1074,22 +1153,24 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
   // (parallel:/models:) drop it so concurrent runs do not fight over one tree.
   const verify = Boolean(spec.verify && agent.readOnly && !forced)
 
-  const runnerDefinition = stepRunnerFor(spec.runner)
-  // "opencode" is accepted for symmetry but resolves to the default (no runner field).
-  const runner: StepRunner | undefined = runnerDefinition.id === "claude-code" ? "claude-code" : undefined
+  // A step names its runner, or inherits defaults.runner.
+  const runnerDefinition = stepRunnerFor(spec.runner ?? ctx.input.defaultRunner)
   if (!runnerDefinition.capabilities.modelFanout && spec.models !== undefined) {
+    const reason = stepRunnerCapabilityReason(runnerDefinition.id, "model-fanout")
     throw new Error(
-      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") can't combine runner: ${runnerDefinition.id} with a "models" fan-out; give the step a single model (or none for the CLI default)`,
+      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") can't combine runner: ${runnerDefinition.id} with a "models" fan-out (${reason}); give the step a single model (or none for the CLI default)`,
     )
   }
   if (!runnerDefinition.capabilities.writeSteps && !ctx.forcedReadOnly && !agent.readOnly) {
+    const reason = stepRunnerCapabilityReason(runnerDefinition.id, "write")
     throw new Error(
-      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which currently supports read-only audit steps only — agent "${agent.name}" can modify the repo`,
+      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which cannot write (${reason}) — agent "${agent.name}" can modify the repo`,
     )
   }
   if (!runnerDefinition.capabilities.verifySteps && verify) {
+    const reason = stepRunnerCapabilityReason(runnerDefinition.id, "verify")
     throw new Error(
-      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which can't run commands — this step has verify: true and needs bash to check its claims`,
+      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which cannot run commands (${reason}) — this step has verify: true and needs bash to check its claims`,
     )
   }
 
@@ -1108,19 +1189,71 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       )
     }
   }
-  const advisor = runnerDefinition.capabilities.advisor ? advisorConfigured : undefined
-  const advisorMaxCalls = advisor ? (spec.advisorMaxCalls ?? ctx.input.defaultAdvisorMaxCalls) : undefined
-  if (spec.advisorMaxCalls !== undefined && !advisor) {
+  if (spec.advisorMaxCalls !== undefined && !(advisorConfigured && runnerDefinition.capabilities.advisor)) {
     throw new Error(
       `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") sets advisorMaxCalls without an advisor; add advisor: <model> or remove the cap`,
     )
   }
 
-  // Runners without global override support own their model namespace and use
-  // an empty string for their own configured default.
-  const variants = runnerDefinition.capabilities.globalModelOverride
-    ? (models ?? [spec.model ?? agent.model ?? ctx.input.defaultModel ?? agent.defaultModel ?? fallbackModel])
-    : [spec.model ? normalizeStepRunnerModel(runnerDefinition.id, spec.model) : ""]
+  // Each variant runs on the step's runner unless a `models:` entry names its
+  // own (`claude-code/sonnet`, written in config as `{ runner, model }`). A
+  // runner-qualified runner normalizes its model now, so a model it cannot
+  // execute fails visibly instead of being dropped or guessed. A model the
+  // step only inherits (from its agent or defaults.model) applies where the
+  // runner accepts it; otherwise the runner keeps its own default.
+  const normalizeOn = (definition: StepRunnerDefinition, value: string, inheritedRunner: boolean): string => {
+    try {
+      return normalizeStepRunnerModel(definition.id, value)
+    } catch (error) {
+      // An inherited runner meets a model chosen for another runner: say which
+      // setting to change rather than guessing an equivalent.
+      if (inheritedRunner) {
+        throw new Error(
+          `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") runs on ${definition.id} through defaults.runner but names the model "${value}", which ${definition.id} does not execute; give it a model ${definition.id} executes or set runner: on the step`,
+        )
+      }
+      throw error
+    }
+  }
+  const accepted = (definition: StepRunnerDefinition, value: string | undefined): string | undefined => {
+    if (value === undefined || qualifiedRunnerOf(value)) return undefined
+    try {
+      return normalizeStepRunnerModel(definition.id, value)
+    } catch {
+      return undefined
+    }
+  }
+  type Variant = { runner: StepRunnerDefinition; value: string; label: string }
+  const variants: Variant[] = models
+    ? models.map((entry) => {
+        const named = explicitRunnerOf(entry)
+        const definition = named ? stepRunnerFor(named) : runnerDefinition
+        const value = normalizeOn(definition, named ? entry.slice(named.length + 1) : entry, !named && spec.runner === undefined)
+        // An entry on the step's own runner keeps its plain name; one on
+        // another runner is named with its runner, so names never collide.
+        return { runner: definition, value, label: named && named !== runnerDefinition.id ? `${named}/${value}` : value }
+      })
+    : [
+        runnerDefinition.qualifiedModels
+          ? (() => {
+              const own = spec.model !== undefined ? normalizeOn(runnerDefinition, spec.model, spec.runner === undefined) : undefined
+              const value = own ?? accepted(runnerDefinition, agent.model) ?? accepted(runnerDefinition, ctx.input.defaultModel) ?? ""
+              return { runner: runnerDefinition, value, label: value }
+            })()
+          : (() => {
+              const inherited = [agent.model, ctx.input.defaultModel].find((candidate) => candidate !== undefined && !qualifiedRunnerOf(candidate))
+              const value = spec.model ?? inherited ?? agent.defaultModel ?? fallbackModel
+              return { runner: runnerDefinition, value, label: value }
+            })(),
+      ]
+  for (const variant of variants) {
+    if (variant.runner.id === runnerDefinition.id) continue
+    if (!variant.runner.capabilities.modelFanout) {
+      throw new Error(
+        `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") fans out to runner: ${variant.runner.id}, which can't run a "models" fan-out (${stepRunnerCapabilityReason(variant.runner.id, "model-fanout")})`,
+      )
+    }
+  }
   // Agent configs are registered per agent name. A verifying step that shares
   // its agent with a non-verifying use in this pipeline needs its own variant
   // so bash does not leak. Forced writable steps still get `__ro`.
@@ -1132,12 +1265,17 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       ? `${agent.name}${readOnlyAgentSuffix}`
       : agent.name
 
-  return variants.map((modelValue, variantIndex) => {
-    const name = models ? `${baseName}__${slugifyModel(modelValue)}` : baseName
+  return variants.map((entry, variantIndex) => {
+    const name = models ? `${baseName}__${slugifyModel(entry.label)}` : baseName
     ctx.claimName(name, models ? `${ctx.position}[${variantIndex + 1}]` : ctx.position)
 
-    const { model, variant } = runner ? { model: modelValue, variant: undefined } : splitModelVariant(modelValue)
+    const { model, variant } = entry.value ? splitModelVariant(entry.value) : { model: "", variant: undefined }
+    // A variant on a runner without an advisor bridge drops an inherited advisor.
+    const advisor = entry.runner.capabilities.advisor ? advisorConfigured : undefined
+    const advisorMaxCalls = advisor ? (spec.advisorMaxCalls ?? ctx.input.defaultAdvisorMaxCalls) : undefined
     const advisorParts = advisor ? splitModelVariant(advisor) : undefined
+    const runnerId = entry.runner.id
+    const runner: StepRunner | undefined = runnerId === defaultStepRunnerId ? undefined : runnerId
     const step: AgentStep = {
       type: "agent",
       name,
@@ -1269,12 +1407,14 @@ export function synthesizeVerifyingAgents(pipeline: Pipeline, baseAgents: readon
 
 /**
  * Agent registry for one run: catalogue agents, with `verify` set on any
- * name a verifying step uses as-is, plus the `__ro` / `__verify` variants
- * the resolved pipeline points at.
+ * name a verifying step uses as-is (prefix or goal fragment), plus the
+ * `__ro` / `__verify` variants the resolved pipeline points at.
  */
 export function agentsForPipeline(pipeline: Pipeline, baseAgents: readonly AgentSpec[]): AgentSpec[] {
   const verifyingNames = new Set(
-    pipeline.steps.filter((step): step is AgentStep => step.type === "agent" && Boolean(step.verify)).map((step) => step.agentName),
+    [...pipeline.steps, ...goalFragmentSteps(pipeline)]
+      .filter((step): step is AgentStep => step.type === "agent" && Boolean(step.verify))
+      .map((step) => step.agentName),
   )
   return [
     ...baseAgents.map((agent) => (verifyingNames.has(agent.name) ? { ...agent, verify: true } : agent)),

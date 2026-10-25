@@ -1,25 +1,30 @@
-import { copyFile, mkdir, open, readFile, writeFile } from "node:fs/promises"
-import { basename, dirname, isAbsolute, join, relative } from "node:path"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { isAbsolute, join, relative } from "node:path"
+import { fileURLToPath } from "node:url"
 
-import type { FilePartInput } from "@opencode-ai/sdk/v2"
+import type { FilePartInput } from "./opencode-client"
 
-import { loadAgentPrompt } from "./agents"
-import { log } from "./log"
+import { withoutHerdrEnv } from "./herdr"
+import { ndjsonLines } from "./ndjson"
+import { RawStreamLog } from "./raw-stream-log"
 import { openSessionCommand, shellQuote, type SessionWindowBackend } from "./opencode"
+import { resolveClaudeAuth } from "./runners/claude/auth"
+import { applyAuthOverlay } from "./runners/claude/effective-auth"
+import type { AuthenticationSelection } from "./runners/contracts"
 import type { ProgressMessage, ProgressTokens, ProgressUI } from "./progress"
 import { stepRunnerFor } from "./step-runners"
-import type { AgentStep, Pipeline } from "./types"
-import type { Workspace } from "./workspace"
+import { ensureRunnersAvailable, whichOnPath } from "./runner-installation"
+import type { Pipeline } from "./types"
 
 /**
- * Runner for `runner: claude-code` steps: spawns the user's local `claude`
- * CLI headless instead of an OpenCode session. Authentication is whatever
- * that install already uses (subscription login or ANTHROPIC_API_KEY), so
- * Convoy never touches credentials. v1 supports read-only audit steps only —
- * the CLI runs with read/search tools exclusively, and the report is the
- * final assistant text, persisted by Convoy like any other read-only step.
+ * Claude Code helpers shared by the runner and the CLI: binary discovery, the
+ * stream-json event decoder the adapter (runners/claude/adapter.ts) renders,
+ * the raw stream log, and reopening a finished session (`claude --resume`,
+ * `[o]`) or an interactive window under the reviewed auth overlay. Attempts
+ * themselves run through the adapter, never through this module.
  */
+
+export { ndjsonLines }
 
 export const claudeBinaryName = "claude"
 
@@ -40,21 +45,16 @@ export function pipelineUsesClaudeCode(pipeline: Pipeline): boolean {
   return pipeline.steps.some((step) => step.type === "agent" && step.runner === "claude-code")
 }
 
+export { whichOnPath }
+
 /**
  * Fail-fast dependency check: Claude Code is optional — only a pipeline that
  * actually contains a claude-code step requires the CLI, and it must fail at
- * launch, never minutes into a run.
+ * launch, never minutes into a run. (The runner-generic check is
+ * `ensureRunnersAvailable`.)
  */
-export function ensureClaudeAvailable(pipeline: Pipeline, which: (bin: string) => string | null = Bun.which) {
-  if (!pipelineUsesClaudeCode(pipeline)) return
-  if (which(claudeBinaryName)) return
-  const steps = pipeline.steps
-    .filter((step) => step.type === "agent" && step.runner === "claude-code")
-    .map((step) => step.name)
-    .join(", ")
-  throw new Error(
-    `pipeline "${pipeline.name}" uses runner: claude-code (steps: ${steps}) but the \`claude\` CLI was not found in PATH; install Claude Code (https://code.claude.com) or remove those steps`,
-  )
+export function ensureClaudeAvailable(pipeline: Pipeline, which: (bin: string) => string | null = whichOnPath) {
+  ensureRunnersAvailable(pipeline, which, ["claude-code"])
 }
 
 /** Display label for attempt lines and usage rows, mirroring provider/model formatting. */
@@ -220,50 +220,6 @@ function truncate(value: string, max: number) {
 // prompt assembly
 // ---------------------------------------------------------------------------
 
-/**
- * OpenCode receives attachments as file parts; the claude CLI receives the
- * same files as absolute paths listed in the prompt, readable thanks to
- * --add-dir on the run workspace (the exact mirror of the OpenCode read-only
- * agents' external_directory allow rule).
- */
-export function claudePrompt(basePrompt: string, attachments: readonly FilePartInput[]): string {
-  const paths = attachmentPaths(attachments)
-
-  if (paths.length === 0) return basePrompt
-
-  return [
-    basePrompt,
-    "",
-    "## Attached files",
-    "This runner delivers attachments as files on disk instead of inline parts. Read each of these before acting:",
-    ...paths.map((entry) => `- ${entry.path}${entry.filename && !entry.path.endsWith(entry.filename) ? ` (${entry.filename})` : ""}`),
-  ].join("\n")
-}
-
-export function claudeArgs(input: {
-  systemPromptPath: string
-  runDir: string
-  targetDir: string
-  model: string
-  attachments: readonly FilePartInput[]
-}): string[] {
-  const readableDirectories = claudeReadableDirectories(input.attachments, input.targetDir, input.runDir)
-
-  return [
-    "-p",
-    "--output-format",
-    "stream-json",
-    "--verbose",
-    "--include-partial-messages",
-    "--append-system-prompt-file",
-    input.systemPromptPath,
-    "--add-dir",
-    ...readableDirectories,
-    ...readOnlyToolArgs,
-    ...(input.model ? ["--model", input.model] : []),
-  ]
-}
-
 export function claudeReadableDirectories(
   attachments: readonly FilePartInput[],
   targetDir: string,
@@ -297,249 +253,8 @@ function isWithin(path: string, root: string): boolean {
   return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))
 }
 
-export async function stageClaudeAttachments(
-  attachments: readonly FilePartInput[],
-  targetDir: string,
-  runDir: string,
-  stageDir: string,
-): Promise<FilePartInput[]> {
-  const staged: FilePartInput[] = []
-  for (const [index, attachment] of attachments.entries()) {
-    const [details] = attachmentPaths([attachment])
-    if (!details || details.isDirectory || isWithin(details.path, targetDir) || isWithin(details.path, runDir)) {
-      staged.push(attachment)
-      continue
-    }
-    await mkdir(stageDir, { recursive: true })
-    const stagedPath = join(stageDir, `${index}-${basename(details.path)}`)
-    await copyFile(details.path, stagedPath)
-    staged.push({ ...attachment, url: pathToFileURL(stagedPath).href })
-  }
-  return staged
-}
-
-// ---------------------------------------------------------------------------
-// execution
-// ---------------------------------------------------------------------------
-
-/** The subset of runner.ts' RunShutdown this module needs (structural, to avoid an import cycle). */
-export type ClaudeShutdown = {
-  signal: AbortSignal
-  aborted: boolean
-  throwIfRequested(): void
-  abortError(fallback?: unknown): Error
-}
-
-export type ClaudePhaseResult = {
-  assistantText: string
-  sessionID?: string
-  cost?: number
-  tokens?: ProgressTokens
-  finish?: string
-  error?: string
-}
-
-type ClaudeProcess = {
-  stdout: ReadableStream<Uint8Array>
-  stderr: ReadableStream<Uint8Array>
-  exited: Promise<number>
-  exitCode: number | null
-  kill(): void
-}
-
-export type ClaudeExecutionDeps = {
-  spawn(command: string[], options: { cwd: string; stdin: Blob; stdout: "pipe"; stderr: "pipe" }): ClaudeProcess
-  stageAttachments: typeof stageClaudeAttachments
-}
-
-const defaultClaudeExecutionDeps: ClaudeExecutionDeps = {
-  spawn: (command, options) => Bun.spawn(command, options),
-  stageAttachments: stageClaudeAttachments,
-}
-
-export async function promptClaudePhase(input: {
-  phase: AgentStep
-  workspace: Workspace
-  targetDir: string
-  prompt: string
-  attachments: readonly FilePartInput[]
-  attempt: number
-  progress: ProgressUI
-  shutdown: ClaudeShutdown
-  sessionRef?: { id?: string }
-  deps?: ClaudeExecutionDeps
-}): Promise<ClaudePhaseResult> {
-  input.shutdown.throwIfRequested()
-  const deps = input.deps ?? defaultClaudeExecutionDeps
-
-  const systemPrompt = loadAgentPrompt(baseAgentName(input.phase.agentName), input.targetDir)
-  const systemPromptPath = await writeClaudeSystemPrompt(input.workspace, input.phase, input.attempt, systemPrompt)
-  const stageDir = join(input.workspace.dir, "attachments", encodeURIComponent(input.phase.name), String(input.attempt))
-  const attachments = await deps.stageAttachments(input.attachments, input.targetDir, input.workspace.dir, stageDir)
-  const readableDirectories = claudeReadableDirectories(attachments, input.targetDir, input.workspace.dir)
-  const args = claudeArgs({
-    systemPromptPath,
-    runDir: input.workspace.dir,
-    targetDir: input.targetDir,
-    model: input.phase.model,
-    attachments,
-  })
-  const prompt = claudePrompt(input.prompt, attachments)
-
-  const proc = deps.spawn([claudeBinaryName, ...args], {
-    cwd: input.targetDir,
-    stdin: new Blob([prompt]),
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-
-  const kill = () => proc.kill()
-  input.shutdown.signal.addEventListener("abort", kill, { once: true })
-  if (input.shutdown.signal.aborted) kill()
-  // Drain stderr immediately so a noisy hook/plugin cannot fill the pipe and
-  // deadlock the child while stdout is still streaming.
-  const stderrPromise = new Response(proc.stderr).text()
-
-  const state = newClaudeStreamState()
-  const rawLog = claudeRawStreamLog(input.workspace, input.phase, input.attempt)
-  let sessionID: string | undefined
-  let result: ClaudeSignal & { type: "result" } | undefined
-
-  try {
-    for await (const line of ndjsonLines(proc.stdout)) {
-      await rawLog.append(line)
-      let event: unknown
-      try {
-        event = JSON.parse(line)
-      } catch {
-        continue // partial writes or non-JSON noise never kill the run
-      }
-      for (const signal of describeClaudeEvent(event, state)) {
-        if (signal.type === "session") {
-          sessionID = signal.sessionID
-          await writeClaudeSessionDirectories(input.workspace.dir, signal.sessionID, readableDirectories)
-          if (input.sessionRef) input.sessionRef.id = signal.sessionID
-          input.progress.phaseSession(input.phase.name, signal.sessionID)
-          log.info(`[${input.phase.name}] claude session: ${signal.sessionID}`)
-        } else if (signal.type === "message") {
-          input.progress.phaseMessage(input.phase.name, signal.message)
-        } else if (signal.type === "activity") {
-          input.progress.phaseActivity(input.phase.name, signal.message, signal.kind, signal.pulse)
-        } else {
-          result = signal
-        }
-      }
-    }
-
-    const [exitCode, stderr] = await Promise.all([proc.exited, stderrPromise])
-    input.shutdown.throwIfRequested()
-
-    if (result) {
-      if (result.cost !== undefined || result.tokens) {
-        input.progress.phaseUsageTotal(input.phase.name, {
-          ...(sessionID ? { sessionID } : {}),
-          ...(result.cost !== undefined ? { cost: result.cost } : {}),
-          ...(result.tokens ? { tokens: result.tokens } : {}),
-          model: claudeModelLabel(input.phase.model),
-        })
-      }
-      return {
-        assistantText: result.text,
-        ...(sessionID ? { sessionID } : {}),
-        ...(result.cost !== undefined ? { cost: result.cost } : {}),
-        ...(result.tokens ? { tokens: result.tokens } : {}),
-        finish: result.subtype,
-        ...(result.isError ? { error: `claude exited with ${result.subtype}${result.text ? `: ${truncate(result.text, 300)}` : ""}` } : {}),
-      }
-    }
-
-    const detail = stderr.trim().split("\n").slice(-3).join(" ").trim()
-    throw new Error(`claude exited with status ${exitCode} before reporting a result${detail ? `: ${detail}` : ""}`)
-  } catch (error) {
-    if (input.shutdown.aborted) throw input.shutdown.abortError(error)
-    throw error
-  } finally {
-    await rawLog.close()
-    input.shutdown.signal.removeEventListener("abort", kill)
-    if (proc.exitCode === null) proc.kill()
-  }
-}
-
-async function writeClaudeSystemPrompt(workspace: Workspace, phase: AgentStep, attempt: number, contents: string): Promise<string> {
-  const directory = join(workspace.dir, "prompts")
-  const path = join(directory, `${encodeURIComponent(phase.name)}.${attempt}.claude.md`)
-  await mkdir(directory, { recursive: true, mode: 0o700 })
-  await writeFile(path, contents, { mode: 0o600 })
-  return path
-}
-
-/** Synthesized read-only variants ("agent__ro") share the base agent's prompt file. */
-function baseAgentName(agentName: string): string {
-  return agentName.endsWith("__ro") ? agentName.slice(0, -"__ro".length) : agentName
-}
-
-function claudeRawStreamLog(workspace: Workspace, phase: AgentStep, attempt: number) {
-  const path = join(workspace.dir, "logs", `${phase.name}.${attempt}.claude.jsonl`)
-  return new ClaudeRawStreamLog(path, phase.name)
-}
-
-class ClaudeRawStreamLog {
-  private file: Awaited<ReturnType<typeof open>> | undefined
-  private failed = false
-
-  constructor(private readonly path: string, private readonly phaseName: string) {}
-
-  async append(line: string) {
-    if (this.failed) return
-    try {
-      const file = await this.openFile()
-      await file.write(`${line}\n`)
-    } catch (error) {
-      await this.fail(error)
-    }
-  }
-
-  async close() {
-    try {
-      await this.file?.close()
-      this.file = undefined
-    } catch (error) {
-      await this.fail(error)
-    }
-  }
-
-  private async openFile() {
-    if (this.file) return this.file
-    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 })
-    this.file = await open(this.path, "w", 0o600)
-    await this.file.chmod(0o600)
-    return this.file
-  }
-
-  private async fail(error: unknown) {
-    if (this.failed) return
-    this.failed = true
-    await this.file?.close().catch(() => undefined)
-    this.file = undefined
-    log.warn(`[${this.phaseName}] couldn't write claude stream log: ${error instanceof Error ? error.message : String(error)}`)
-  }
-}
-
-export async function* ndjsonLines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
-  const decoder = new TextDecoder()
-  let buffer = ""
-  for await (const chunk of stream) {
-    buffer += decoder.decode(chunk, { stream: true })
-    const lines = buffer.split("\n")
-    buffer = lines.pop() ?? ""
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (trimmed) yield trimmed
-    }
-  }
-  const tail = (buffer + decoder.decode()).trim()
-  if (tail) yield tail
-}
+/** Tees a Claude attempt's raw stream-json lines to an owner-only file (the shared raw stream log). */
+export const ClaudeRawStreamLog = RawStreamLog
 
 // ---------------------------------------------------------------------------
 // post-step interactive resume ([o] on a finished claude-code step)
@@ -561,14 +276,20 @@ export function claudeResumeArgs(sessionID: string, readableDirectories: readonl
   return [...readOnlyToolArgs, "--add-dir", ...readableDirectories, "--resume", sessionID]
 }
 
-async function writeClaudeSessionDirectories(runDir: string, sessionID: string, directories: readonly string[]): Promise<void> {
+/** Records what a Claude session could read, so `[o]` reopens it with the same `--add-dir` set. */
+export async function writeClaudeSessionDirectories(runDir: string, sessionID: string, directories: readonly string[]): Promise<void> {
   const logsDir = join(runDir, "logs")
   await mkdir(logsDir, { recursive: true })
   await writeFile(claudeSessionDirectoriesPath(runDir, sessionID), JSON.stringify(directories))
 }
 
 async function readClaudeSessionDirectories(runDir: string, sessionID: string): Promise<string[]> {
-  const parsed: unknown = JSON.parse(await readFile(claudeSessionDirectoriesPath(runDir, sessionID), "utf8"))
+  const raw = await readFile(claudeSessionDirectoriesPath(runDir, sessionID), "utf8").catch((error: NodeJS.ErrnoException) => {
+    // A session recorded before the engine wrote this file could read its run dir.
+    if (error.code === "ENOENT") return JSON.stringify([runDir])
+    throw error
+  })
+  const parsed: unknown = JSON.parse(raw)
   if (!Array.isArray(parsed) || parsed.some((directory) => typeof directory !== "string" || directory.length === 0)) {
     throw new Error(`invalid readable-directory metadata for Claude session ${sessionID}`)
   }
@@ -577,4 +298,44 @@ async function readClaudeSessionDirectories(runDir: string, sessionID: string): 
 
 function claudeSessionDirectoriesPath(runDir: string, sessionID: string): string {
   return join(runDir, "logs", `claude-${encodeURIComponent(sessionID)}-directories.json`)
+}
+
+/**
+ * The shell prefix that gives an interactive Claude client the reviewed
+ * billing source, as the headless adapter's overlay does: subscription drops
+ * ambient API credentials so the operator's login is used, and api-key reads
+ * the key from its named variable at launch. Only variable names are typed,
+ * never a credential value, so nothing secret lands in argv or the pane.
+ */
+export function claudeAuthShellPrefix(auth: AuthenticationSelection = { mode: "subscription" }): string {
+  if (auth.mode === "api-key") {
+    const ref = auth.credentialRef
+    if (!ref || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref)) throw new Error("Claude api-key mode needs credentialRef naming the variable that holds the key")
+    return `unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN; ANTHROPIC_API_KEY="$${ref}"`
+  }
+  return "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN;"
+}
+
+/**
+ * Opens an interactive Claude session in the checkout for a human iteration
+ * or authoring conversation: a normal Claude client with its own permission
+ * prompts, under the reviewed authentication. `resume` reopens that exact
+ * session; without it a fresh conversation starts.
+ */
+export async function openClaudeInteractiveWindow(input: { targetDir: string; auth?: AuthenticationSelection; resume?: string; label?: string; prompt?: string }): Promise<SessionWindowBackend> {
+  const args = [claudeBinaryName, ...(input.resume ? ["--resume", input.resume] : []), ...(input.prompt ? [input.prompt] : [])].map(shellQuote).join(" ")
+  return openSessionCommand(`${claudeAuthShellPrefix(input.auth)} ${args}`, input.targetDir, input.label ?? "claude session")
+}
+
+/** Runs an interactive Claude client in this terminal until it exits, under the reviewed authentication. */
+export async function runInteractiveClaude(input: { targetDir: string; auth?: AuthenticationSelection; resume?: string }): Promise<number> {
+  const resolution = resolveClaudeAuth({ selection: input.auth ?? { mode: "subscription" } })
+  const proc = Bun.spawn([claudeBinaryName, ...(input.resume ? ["--resume", input.resume] : [])], {
+    cwd: input.targetDir,
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+    env: applyAuthOverlay(withoutHerdrEnv(process.env), resolution),
+  })
+  return proc.exited
 }

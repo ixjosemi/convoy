@@ -176,12 +176,23 @@ describe("built-in implement pipeline", () => {
 })
 
 describe("built-in pipeline catalog", () => {
-  test("offers the six consolidated pipelines without private model providers", () => {
-    expect(Object.keys(builtInPipelines).sort()).toEqual(["fixer", "full-cycle", "hunter", "implement", "review", "ship"])
+  test("offers the consolidated pipelines without private model providers", () => {
+    expect(Object.keys(builtInPipelines).sort()).toEqual(["claude-full-cycle", "claude-review", "fixer", "full-cycle", "hunter", "implement", "review", "ship"])
     expect(JSON.stringify(builtInPipelines)).not.toMatch(/nan\//i)
     for (const [name, spec] of Object.entries(builtInPipelines)) {
       expect(() => resolvePipeline({ name, spec, agents: builtInAgents })).not.toThrow()
     }
+  })
+
+  test("ships a Claude-only preset with no OpenCode steps", () => {
+    const pipeline = resolvePipeline({ name: "claude-review", spec: builtInPipelines["claude-review"]!, agents: builtInAgents })
+    const agents = pipeline.steps.filter((step): step is AgentStep => step.type === "agent")
+    expect(agents.length).toBeGreaterThan(0)
+    expect(agents.every((step) => step.runner === "claude-code")).toBe(true)
+    // The audits fan out across Claude models; no step inherits an OpenCode model.
+    expect(agents.some((step) => step.stepName === "clean-code" && step.model === "sonnet")).toBe(true)
+    expect(agents.every((step) => !step.model.includes("/"))).toBe(true)
+    expect(pipeline.defaultPrompt).toBeTruthy()
   })
 })
 
@@ -402,18 +413,18 @@ describe("built-in review pipeline", () => {
     expect(scope?.agentName.endsWith("__ro")).toBe(false)
   })
 
-  test("scopes, runs the three audits fanned across two models, synthesizes a findings report, then scores", () => {
+  test("scopes, runs the three audits fanned across DeepSeek 1017 and Sol, synthesizes a findings report, then scores", () => {
     expect(stepNames(scored())).toEqual([
       "scope",
-      "clean-code__openrouter-deepseek-deepseek-v4-1-flash-high",
-      "clean-code__openrouter-z-ai-glm-5-3-flash-high",
-      "security__openrouter-deepseek-deepseek-v4-1-flash-high",
-      "security__openrouter-z-ai-glm-5-3-flash-high",
-      "bugs__openrouter-deepseek-deepseek-v4-1-flash-high",
-      "bugs__openrouter-z-ai-glm-5-3-flash-high",
+      "clean-code__openrouter-deepseek-deepseek-v4-1-flash-1017-high",
+      "clean-code__openai-gpt-6-1-sol-high",
+      "security__openrouter-deepseek-deepseek-v4-1-flash-1017-high",
+      "security__openai-gpt-6-1-sol-high",
+      "bugs__openrouter-deepseek-deepseek-v4-1-flash-1017-high",
+      "bugs__openai-gpt-6-1-sol-high",
       "report",
+      "score__openai-gpt-6-1-sol-xhigh",
       "score__openrouter-z-ai-glm-5-3-high",
-      "score__openrouter-x-ai-grok-4-6-high",
       "score-report",
     ])
   })
@@ -424,12 +435,12 @@ describe("built-in review pipeline", () => {
     expect(findings?.inputFiles).toEqual([
       "prd.md",
       "reports/scope.md",
-      "reports/clean-code__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/clean-code__openrouter-z-ai-glm-5-3-flash-high.md",
-      "reports/security__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/security__openrouter-z-ai-glm-5-3-flash-high.md",
-      "reports/bugs__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/bugs__openrouter-z-ai-glm-5-3-flash-high.md",
+      "reports/clean-code__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/clean-code__openai-gpt-6-1-sol-high.md",
+      "reports/security__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/security__openai-gpt-6-1-sol-high.md",
+      "reports/bugs__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/bugs__openai-gpt-6-1-sol-high.md",
     ])
 
     const report = scored().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")
@@ -438,15 +449,15 @@ describe("built-in review pipeline", () => {
     expect(report?.inputFiles).toEqual([
       "prd.md",
       "reports/scope.md",
-      "reports/clean-code__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/clean-code__openrouter-z-ai-glm-5-3-flash-high.md",
-      "reports/security__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/security__openrouter-z-ai-glm-5-3-flash-high.md",
-      "reports/bugs__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/bugs__openrouter-z-ai-glm-5-3-flash-high.md",
+      "reports/clean-code__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/clean-code__openai-gpt-6-1-sol-high.md",
+      "reports/security__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/security__openai-gpt-6-1-sol-high.md",
+      "reports/bugs__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/bugs__openai-gpt-6-1-sol-high.md",
       "reports/report.md",
+      "reports/score__openai-gpt-6-1-sol-xhigh.md",
       "reports/score__openrouter-z-ai-glm-5-3-high.md",
-      "reports/score__openrouter-x-ai-grok-4-6-high.md",
     ])
   })
 })
@@ -515,36 +526,36 @@ describe("review model choices", () => {
     expect(scope).toMatchObject({ agentName: "review-scope", readOnly: true, verify: true })
   })
 
-  test("runs entirely on low-cost models: DeepSeek V4.1 Flash scopes, audits, and reports, and the scoring stays on GLM 5.3 + Grok 4.6", () => {
+  test("scopes, audits, and reports on DeepSeek 1017, and the scoring stays on GPT-6.1 Sol + GLM 5.3", () => {
     const pipeline = review()
     expect(stepNames(pipeline)).toEqual([
       "scope",
-      "clean-code__openrouter-deepseek-deepseek-v4-1-flash-high",
-      "clean-code__openrouter-z-ai-glm-5-3-flash-high",
-      "security__openrouter-deepseek-deepseek-v4-1-flash-high",
-      "security__openrouter-z-ai-glm-5-3-flash-high",
-      "bugs__openrouter-deepseek-deepseek-v4-1-flash-high",
-      "bugs__openrouter-z-ai-glm-5-3-flash-high",
+      "clean-code__openrouter-deepseek-deepseek-v4-1-flash-1017-high",
+      "clean-code__openai-gpt-6-1-sol-high",
+      "security__openrouter-deepseek-deepseek-v4-1-flash-1017-high",
+      "security__openai-gpt-6-1-sol-high",
+      "bugs__openrouter-deepseek-deepseek-v4-1-flash-1017-high",
+      "bugs__openai-gpt-6-1-sol-high",
       "report",
+      "score__openai-gpt-6-1-sol-xhigh",
       "score__openrouter-z-ai-glm-5-3-high",
-      "score__openrouter-x-ai-grok-4-6-high",
       "score-report",
     ])
 
     const byName = Object.fromEntries(
       pipeline.steps.filter((step): step is AgentStep => step.type === "agent").map((step) => [step.name, step]),
     )
-    expect(byName.scope?.model).toBe("openrouter/deepseek/deepseek-v4.1-flash")
-    expect(byName.report?.model).toBe("openrouter/deepseek/deepseek-v4.1-flash")
+    expect(byName.scope?.model).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017")
+    expect(byName.report?.model).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017")
     expect(byName.report?.inputFiles).toEqual([
       "prd.md",
       "reports/scope.md",
-      "reports/clean-code__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/clean-code__openrouter-z-ai-glm-5-3-flash-high.md",
-      "reports/security__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/security__openrouter-z-ai-glm-5-3-flash-high.md",
-      "reports/bugs__openrouter-deepseek-deepseek-v4-1-flash-high.md",
-      "reports/bugs__openrouter-z-ai-glm-5-3-flash-high.md",
+      "reports/clean-code__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/clean-code__openai-gpt-6-1-sol-high.md",
+      "reports/security__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/security__openai-gpt-6-1-sol-high.md",
+      "reports/bugs__openrouter-deepseek-deepseek-v4-1-flash-1017-high.md",
+      "reports/bugs__openai-gpt-6-1-sol-high.md",
     ])
   })
 
@@ -1080,6 +1091,49 @@ describe("step-level verify", () => {
     expect(byName["quality-score-report"]?.verify).toBe(true)
     expect(synthesizeVerifyingAgents(pipeline, builtInAgents).map((agent) => agent.name)).toEqual([`review-scope${verifyAgentSuffix}`])
   })
+
+  const goalPipeline = (prefix: PipelineSpec["steps"]) =>
+    resolvePipeline({
+      name: "test",
+      spec: {
+        steps: [
+          ...prefix,
+          {
+            goal: {
+              target: 90,
+              improve: { briefStep: "fix", steps: [{ agent: "goal-fixer", name: "fix" }] },
+              measure: {
+                steps: [
+                  { agent: "quality-scorer", name: "score" },
+                  { agent: "quality-score-report", name: "score-report", reports: ["score"], verify: true },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      agents: builtInAgents,
+    })
+
+  test("agentsForPipeline honors verify on goal measure steps", () => {
+    const pipeline = goalPipeline(["implementer"])
+    const scoreReport = pipeline.goalPlan?.measure.steps.find((step) => step.name === "score-report")
+    expect(scoreReport).toMatchObject({ agentName: "quality-score-report", readOnly: true, verify: true })
+
+    const byName = Object.fromEntries(agentsForPipeline(pipeline, builtInAgents).map((agent) => [agent.name, agent]))
+    expect(byName["quality-score-report"]).toMatchObject({ readOnly: true, verify: true })
+    expect(byName["quality-scorer"]?.verify).toBeUndefined()
+  })
+
+  test("a verifying goal step sharing its agent with a non-verifying prefix step gets its own variant", () => {
+    const pipeline = goalPipeline(["implementer", { agent: "quality-score-report", name: "prefix-score" }])
+    const scoreReport = pipeline.goalPlan?.measure.steps.find((step) => step.name === "score-report")
+    expect(scoreReport?.agentName).toBe(`quality-score-report${verifyAgentSuffix}`)
+
+    const byName = Object.fromEntries(agentsForPipeline(pipeline, builtInAgents).map((agent) => [agent.name, agent]))
+    expect(byName["quality-score-report"]?.verify).toBeUndefined()
+    expect(byName[`quality-score-report${verifyAgentSuffix}`]).toMatchObject({ readOnly: true, verify: true })
+  })
 })
 
 describe("claude-code runner steps", () => {
@@ -1129,8 +1183,10 @@ describe("claude-code runner steps", () => {
     expect(steps[0]?.model).toContain("/")
   })
 
-  test("rejects claude-code on a step that can write (v1 is audit-only)", () => {
-    expect(() => agentSteps({ steps: [{ agent: "implementer", runner: "claude-code" }] })).toThrow(/read-only/)
+  test("accepts claude-code on a step that can write", () => {
+    const steps = agentSteps({ steps: [{ agent: "implementer", runner: "claude-code" }] })
+    expect(steps[0]?.runner).toBe("claude-code")
+    expect(steps[0]?.readOnly).toBeUndefined()
   })
 
   test("accepts claude-code inside a parallel block (forced read-only)", () => {
@@ -1151,8 +1207,10 @@ describe("claude-code runner steps", () => {
     expect(claude?.readOnly).toBe(true)
   })
 
-  test("rejects claude-code on a verifying step, which needs bash it cannot give", () => {
-    expect(() => agentSteps({ steps: [{ agent: "review-validator", name: "validator", runner: "claude-code", verify: true }] })).toThrow(/can't run commands/)
+  test("accepts claude-code on a verifying step with bash", () => {
+    const steps = agentSteps({ steps: [{ agent: "review-validator", name: "validator", runner: "claude-code", verify: true }] })
+    expect(steps[0]?.runner).toBe("claude-code")
+    expect(steps[0]?.verify).toBe(true)
   })
 
   test("accepts claude-code on a verifying step forced read-only, where bash is dropped anyway", () => {
@@ -1173,12 +1231,26 @@ describe("claude-code runner steps", () => {
     expect(claude?.verify).toBeUndefined()
   })
 
-  test("rejects claude-code combined with a models: fan-out", () => {
+  test("fans claude-code out across Claude models, normalizing each", () => {
+    const steps = agentSteps({
+      steps: [{ agent: "bug-auditor", runner: "claude-code", models: ["opus", "anthropic/claude-sonnet-4-5"], reports: "none", diff: true }],
+    })
+
+    expect(steps).toHaveLength(2)
+    expect(steps.map((step) => step.runner)).toEqual(["claude-code", "claude-code"])
+    expect(steps.map((step) => step.model)).toEqual(["opus", "claude-sonnet-4-5"])
+    // Every fan-out member is forced read-only and keeps its own session/report.
+    expect(steps.every((step) => step.readOnly)).toBe(true)
+    expect(new Set(steps.map((step) => step.name)).size).toBe(2)
+    expect(new Set(steps.map((step) => step.reportPath)).size).toBe(2)
+  })
+
+  test("rejects a Claude fan-out entry that is not a Claude model, instead of dropping it", () => {
     expect(() =>
       agentSteps({
-        steps: [{ agent: "bug-auditor", runner: "claude-code", models: ["openai/gpt-5.5#xhigh", "anthropic/claude-opus-4-8"] }],
+        steps: [{ agent: "bug-auditor", runner: "claude-code", models: ["opus", "openai/gpt-5.6"] }],
       }),
-    ).toThrow(/models/)
+    ).toThrow("runner claude-code executes Anthropic models")
   })
 })
 
@@ -1249,14 +1321,14 @@ describe("advisor resolution", () => {
     expect(() => agentSteps({ steps: [{ agent: "implementer", advisorMaxCalls: 2 }] })).toThrow("advisorMaxCalls without an advisor")
   })
 
-  test("an advisor named on a claude-code step is an error; an inherited one is dropped", () => {
-    expect(() =>
-      agentSteps({ steps: [{ agent: "bug-auditor", runner: "claude-code", advisor: "anthropic/claude-opus-5", reports: "none" }] }),
-    ).toThrow(/runner: claude-code does not support/)
+  test("a claude-code step takes an advisor, named on the step or inherited", () => {
+    const named = agentSteps({ steps: [{ agent: "bug-auditor", runner: "claude-code", advisor: "claude-code/opus", reports: "none" }] })
+    expect(named[0]?.advisor).toBe("claude-code/opus")
 
+    // An inherited OpenCode advisor is a cross-runner consultation, not dropped.
     const steps = withAdvisor({ steps: [{ agent: "bug-auditor", runner: "claude-code", reports: "none" }] }, "anthropic/claude-opus-5")
     expect(steps[0]?.runner).toBe("claude-code")
-    expect(steps[0]?.advisor).toBeUndefined()
+    expect(steps[0]?.advisor).toBe("anthropic/claude-opus-5")
   })
 
   test("every variant of a models: fan-out inherits the same advisor", () => {

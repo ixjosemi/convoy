@@ -17,7 +17,7 @@ PRD → implementer → patterns → security → design → tests → measure
                                                            └ fix┘
 ```
 
-All model IDs below are public provider IDs. The former local NAN models use their OpenRouter equivalents: `openrouter/deepseek/deepseek-v4.1-flash#high` and `openrouter/z-ai/glm-5.3-flash#high`.
+All model IDs below are public provider IDs. The former local NAN models use their OpenRouter equivalents: `openrouter/deepseek/deepseek-v4.1-flash#high` and `openrouter/z-ai/glm-5.3-flash#high`. `review` pins the newer `openrouter/deepseek/deepseek-v4.1-flash-1017#high` snapshot and `openai/gpt-6.1-sol#high` for its audits.
 
 | Step | Model | Advisor |
 |---|---|---|
@@ -43,7 +43,9 @@ Select one with `-p/--pipeline`; no project config is needed. `full-cycle` is th
 | `full-cycle` | yes | Implement, audit, polish and test with the models above, then independently score and fix gaps up to five times to reach 90/100. |
 | `implement` | yes | DeepSeek V4.1 Flash implements with Astra xhigh advice. Patterns and tests use DeepSeek; security and design use GLM Flash. Those later steps run unadvised. Closes with a read-only DeepSeek recap at `reports/run-report.md`; no scoring loop. |
 | `ship` | yes | Sync with the base; scope and review the diff across DeepSeek and GLM Flash; report, adversarially triage and fix accepted findings with Astra advice; recap; then score with Grok and GLM, reconcile on GLM and fix gaps up to five times to reach 90/100. |
-| `review` | no | The report-only review: DeepSeek scopes and reports; clean-code, security and bug audits each run on DeepSeek and GLM Flash. Grok and GLM score independently, then GLM verifies the consensus. Produces findings and a quality score. |
+| `review` | no | The report-only review: DeepSeek V4.1 Flash 1017 scopes and reports; clean-code, security and bug audits each run on DeepSeek 1017 and GPT-6.1 Sol. GPT-6.1 Sol xhigh and GLM 5.3 high score independently, then GLM verifies the consensus. Produces findings and a quality score. |
+| `claude-review` | no | Claude-only report: Sonnet scopes the diff, clean-code/security/bug audits fan out across Opus and Sonnet, and Opus synthesizes one prioritized findings report. Needs no OpenCode. |
+| `claude-full-cycle` | yes | Claude-only full cycle: Sonnet implements and fixes advised by Opus; audits and tests run on Sonnet; Opus and Sonnet score with a verified Opus consensus, fixing gaps up to five times to reach 90/100. Needs no OpenCode. |
 | `fixer` | yes | Prove supplied findings with regression tests, apply targeted fixes, then independently rerun the checks. Terra xhigh handles all three phases; Astra xhigh advises reproduction and fixes. |
 | `hunter` | no | The maximum-coverage audit: six specialty tracks each run on Terra, Opus via OpenRouter, GLM 5.3, Kimi K3 and Grok 4.6 (30 audits), followed by a Sol xhigh consensus. |
 
@@ -52,6 +54,38 @@ Select one with `-p/--pipeline`; no project config is needed. `full-cycle` is th
 `review` assesses the current branch/PR diff; `hunter` defaults to the whole repository unless the prompt narrows its scope. `fixer` takes specific findings and produces a verdict for each.
 
 The catalog consolidates the former variants: `review-lite` is now `review`, `astra` is now `full-cycle`, and `hunter-max` is now `hunter`; `review-cc`, the previous `review`, `implement-lite`, and the previous `full-cycle` and `hunter` definitions are removed. Existing global or project pipeline overrides still take precedence: rename or remove those entries to use the new built-ins. Frozen pipelines in saved runs remain available to `--resume`.
+
+
+## Listing pipelines
+
+`convoy pipelines` lists every pipeline the repository can run, built-in, global, and project, with what each changes and which runners it needs, plus the agents a pipeline can use. `convoy pipelines show <name>` prints one pipeline's resolved steps: agent, model, runner, advisor, read-only, parallel groups, and its goal loop. Both take `--json` and `--dir <repo>`. For a concrete run, `--plan` remains the full picture, with models routed through the run's gateway.
+
+## Pipeline files
+
+A pipeline doesn't have to live in your config. `--pipeline-file <path>` runs one defined in its own YAML file: the mapping a `pipelines.<name>` entry takes (`steps`, `description`, `defaultPrompt`, `maxConcurrentAgents`, …), plus an optional `name` that defaults to the file name.
+
+```yaml
+# focused-audit.yaml
+description: Bugs and security in two model families, one report
+steps:
+  - parallel:
+      - agent: bug-auditor
+        name: bugs
+        models: [openrouter/deepseek/deepseek-v4.1-flash-1017#high, openai/gpt-6.1-sol#high]
+      - agent: security-reviewer
+        name: security
+        models: [openrouter/deepseek/deepseek-v4.1-flash-1017#high, openai/gpt-6.1-sol#high]
+  - agent: review-report
+    name: report
+    reports: all
+```
+
+```bash
+convoy pipelines show --pipeline-file focused-audit.yaml   # validate and print the resolved steps
+convoy --pipeline-file focused-audit.yaml --manual "Audit src/payments"
+```
+
+The file is validated exactly like a config pipeline (the [configuration rules](configuration.md#project-configuration-convoyconfigyaml) apply), uses the agents your config defines, and is frozen into the run, so `--resume` and retry replay it. `hooks.pipelines.<name>` entries apply under the file's name. It can't be combined with `--pipeline`. This is how an [agent session](agents.md) composes a pipeline for a task without touching your config.
 
 ---
 

@@ -1,21 +1,35 @@
 import { gatewayLabel, stripOpenRouterNitro, type ResolvedModel } from "./model-routing"
-import type { RunPlan } from "./types"
+import { runnerOfModelReference, stepRunnerFor } from "./step-runners"
+import type { AgentStep, RunPlan } from "./types"
 
 type DiscoveredModel = { variants?: unknown }
 type DiscoveredProvider = { id?: unknown; models?: unknown }
 export type ProviderCatalog = { all: readonly DiscoveredProvider[]; connected: readonly string[] }
 
-/** The exact OpenCode targets that must be available before a run can begin. */
+/**
+ * The exact OpenCode targets that must be available before a run can begin.
+ * A CLI runner's models (`claude-code/<model>`, `codex/<model>` steps,
+ * advisors and judges) are not OpenCode catalog entries: that runner's own
+ * preflight checks them.
+ */
 export function preflightTargets(plan: RunPlan): ResolvedModel[] {
+  return opencodeTargets(plan).filter((target) => !stepRunnerFor(runnerOfModelReference(target)).qualifiedModels)
+}
+
+function runsOnOpencode(step: AgentStep): boolean {
+  return !stepRunnerFor(step.runner).qualifiedModels
+}
+
+function opencodeTargets(plan: RunPlan): ResolvedModel[] {
   const targets = plan.pipeline.steps.flatMap((step) =>
-    step.type === "agent" && step.runner !== "claude-code" && step.resolvedModel ? [step.resolvedModel] : [],
+    step.type === "agent" && runsOnOpencode(step) && step.resolvedModel ? [step.resolvedModel] : [],
   )
   // The goal fragments preflight with the prefix: an unavailable model must
   // reject the parent plan before the first run is paid for, even when it
   // would only run in a later iteration.
   if (plan.goal) {
     for (const step of [...plan.goal.improve.steps, ...plan.goal.measure.steps]) {
-      if (step.runner !== "claude-code" && step.resolvedModel) targets.push(step.resolvedModel)
+      if (runsOnOpencode(step) && step.resolvedModel) targets.push(step.resolvedModel)
       if (step.resolvedAdvisor) targets.push(step.resolvedAdvisor)
     }
   }
@@ -25,7 +39,8 @@ export function preflightTargets(plan: RunPlan): ResolvedModel[] {
   for (const step of plan.pipeline.steps) {
     if (step.type === "agent" && step.resolvedAdvisor) targets.push(step.resolvedAdvisor)
   }
-  if (plan.smartJudge) targets.push(plan.smartJudge.model)
+  // A CLI runner's judge is checked by that runner's own preflight, not the OpenCode catalog.
+  if (plan.smartJudge && !stepRunnerFor(plan.smartJudge.runner).qualifiedModels) targets.push(plan.smartJudge.model)
   // No branch namer here: naming happens in the launcher, before the plan is
   // built, so nothing is left to call once the run is confirmed.
   return targets

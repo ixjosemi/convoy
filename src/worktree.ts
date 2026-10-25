@@ -3,7 +3,7 @@ import { access, constants, mkdir, readFile, realpath, stat } from "node:fs/prom
 import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
-import type { AgentConfig, Config, OpencodeClient } from "@opencode-ai/sdk/v2"
+import { toolPermissions, type AgentConfig, type Config, type OpencodeClient } from "./opencode-client"
 
 import { loadMergedConvoyConfig, type ConvoyConfig } from "./config"
 import { addWorktree, branchExists } from "./git"
@@ -12,6 +12,12 @@ import { startOpencode } from "./opencode"
 import { splitModelVariant } from "./pipeline"
 import { parseModel } from "./runner"
 import { convoyHome } from "./workspace"
+import { cliHelperRoute } from "./helper-routes"
+import { helperInferenceFor, type HelperInference } from "./runners/helper-inference"
+import type { AuthenticationSelection } from "./runners/contracts"
+
+/** Read-only tools for the branch namer; translated to V2 session permissions at create. */
+const namerTools: Record<string, boolean> = { read: true, list: true, glob: true, grep: true, webfetch: true, write: false, edit: false, bash: false, todoread: false, todowrite: false }
 
 export type WorktreeResult = {
   /** Absolute path of the newly created worktree. */
@@ -31,8 +37,10 @@ export type WorktreeInput = {
 export type BranchNameInput = {
   prompt: string
   targetDir: string
-  /** Override the model used to name the branch (provider/model[#variant]). */
+  /** Override the model used to name the branch (provider/model[#variant], or a CLI runner's `<runner>/<model>`). */
   model?: string
+  /** The authentication a CLI runner's namer route runs under; defaults to subscription. */
+  auth?: AuthenticationSelection
   /** Free-text steer from the user, e.g. "call it after the budget limits". Outranks the prompt. */
   guidance?: string
   signal?: AbortSignal
@@ -383,6 +391,26 @@ export async function proposeBranchName(input: BranchNameInput): Promise<BranchN
 
   let error: string | undefined
   try {
+    const model = input.model ?? defaultBranchNameModel
+    const route = cliHelperRoute(model)
+    const infer = route ? helperInferenceFor(route.runner) : undefined
+    if (route && infer) {
+      // A CLI runner's route needs no OpenCode server: one read-only inference.
+      const reply = await infer({
+        prompt: namerMessage(resolved, input.guidance),
+        system: branchNameSystemPrompt,
+        model: route.model,
+        ...(route.variant ? { variant: route.variant } : {}),
+        auth: input.auth ?? { mode: "subscription" },
+        cwd: input.targetDir,
+        tools: "read-only",
+        timeoutMs: branchNameTimeoutMs,
+        ...(input.signal ? { signal: input.signal } : {}),
+      })
+      const branch = readBranchName(reply.text)
+      if (branch) return { branch, source: "model" }
+      throw new Error(`the namer's reply had no usable branch name: ${truncate(reply.text, 160)}`)
+    }
     const handle = await startOpencode(namerOpencodeConfig(), AbortSignal.timeout(branchNameTimeoutMs))
     try {
       const reply = await askForBranchName(handle.client, {
@@ -421,7 +449,8 @@ export async function askForBranchName(client: OpencodeClient, input: BranchName
   let sessionID: string | undefined
   try {
     const session = await client.session.create(
-      { directory: input.targetDir, title: "convoy branch namer" },
+      { directory: input.targetDir, title: "convoy branch namer", permissions: toolPermissions(namerTools) },
+
       { signal: controller.signal },
     )
     if (session.error || !session.data?.id) throw new Error("couldn't open a naming session")
@@ -438,7 +467,7 @@ export async function askForBranchName(client: OpencodeClient, input: BranchName
         // resolve, the reply must still follow the contract rather than be a
         // free-form answer from opencode's default persona.
         system: branchNameSystemPrompt,
-        tools: { read: true, list: true, glob: true, grep: true, webfetch: true, write: false, edit: false, bash: false, todoread: false, todowrite: false },
+        tools: namerTools,
         parts: [{ type: "text", text: namerMessage(input.prompt, input.guidance) }],
       },
       { signal: controller.signal },

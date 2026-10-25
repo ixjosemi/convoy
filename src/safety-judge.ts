@@ -1,6 +1,9 @@
-import type { OpencodeClient } from "@opencode-ai/sdk/v2"
+import type { OpencodeClient } from "./opencode-client"
 
 import { log } from "./log"
+import type { AuthenticationSelection } from "./runners/contracts"
+import { helperInferenceFor, type HelperInferenceSeams } from "./runners/helper-inference"
+import { runnerOfModelReference } from "./step-runners"
 
 /** An external classifier's call on whether a permission request is safe to auto-approve. */
 export type SafetyVerdict = { safe: boolean; reason: string }
@@ -15,12 +18,27 @@ export type JudgeRequest = {
 
 export type JudgeInput = {
   request: JudgeRequest
-  /** The prompt body accepts providerID/modelID only — no variant. */
-  model: { providerID: string; modelID: string }
+  /**
+   * The judge route's model. A runner-qualified route (`providerID` naming a
+   * CLI runner, as `claude-code/<model>` or `codex/<model>`) judges through
+   * that runner's CLI under `auth`, so a Claude- or Codex-only install needs
+   * no OpenCode; any other provider judges on the run's OpenCode server. The
+   * OpenCode prompt body accepts providerID/modelID only — no variant.
+   */
+  model: { providerID: string; modelID: string; variant?: string }
   directory: string
   signal?: AbortSignal
   /** Override for the per-request budget; defaults to 20s. */
   timeoutMs?: number
+  /** The reviewed authentication for a CLI-routed judge; defaults to subscription. */
+  auth?: AuthenticationSelection
+  /** Test seams for the CLI runners. */
+  inferenceSeams?: HelperInferenceSeams
+}
+
+/** True when the judge route runs on a CLI runner rather than an OpenCode server. */
+export function isCliJudge(model: { providerID: string }): boolean {
+  return helperInferenceFor(runnerOfModelReference(model)) !== undefined
 }
 
 const defaultTimeoutMs = 20_000
@@ -69,16 +87,37 @@ const explainSystemPrompt = [
  * (best-effort) in the finally block. Throws on error or timeout.
  */
 async function runJudgeSession(
-  client: OpencodeClient,
+  client: OpencodeClient | undefined,
   input: {
     directory: string
-    model: { providerID: string; modelID: string }
+    model: { providerID: string; modelID: string; variant?: string }
     system: string
     text: string
     signal?: AbortSignal
     timeoutMs: number
+    auth?: AuthenticationSelection
+    inferenceSeams?: HelperInferenceSeams
   },
 ): Promise<string> {
+  const infer = helperInferenceFor(runnerOfModelReference(input.model), input.inferenceSeams)
+  if (infer) {
+    // Tool-less, one-shot, under the reviewed auth: it can only classify.
+    const answer = await infer({
+      prompt: input.text,
+      system: input.system,
+      model: input.model.modelID,
+      ...(input.model.variant ? { variant: input.model.variant } : {}),
+      auth: input.auth ?? { mode: "subscription" },
+      cwd: input.directory,
+      tools: "none",
+      timeoutMs: input.timeoutMs,
+      ...(input.signal ? { signal: input.signal } : {}),
+    }).catch((error: unknown) => {
+      throw new Error(error instanceof Error && error.message.endsWith("timed out") ? "safety judge timed out" : error instanceof Error ? error.message : String(error))
+    })
+    return answer.text
+  }
+  if (!client) throw new Error(`no OpenCode server is running for the ${input.model.providerID}/${input.model.modelID} judge`)
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(new Error("safety judge timed out")), input.timeoutMs)
   const onParentAbort = () => controller.abort(input.signal?.reason)
@@ -90,7 +129,15 @@ async function runJudgeSession(
   let sessionID: string | undefined
   try {
     const session = await client.session.create(
-      { directory: input.directory, title: "convoy safety judge" },
+      {
+        directory: input.directory,
+        title: "convoy safety judge",
+        // V2 has no per-prompt `tools` map: a tool-less judge must deny every
+        // action at session creation. Denying only specific tools is not enough
+        // — a model can fall back to another (e.g. shell after `read`).
+        // Validated against a real V2 server: `action: "*"` blocks all tools.
+        permissions: [{ action: "*", resource: "*", effect: "deny" }],
+      },
       { signal: controller.signal },
     )
     if (session.error || !session.data?.id) throw new Error("safety judge couldn't open a session")
@@ -100,7 +147,7 @@ async function runJudgeSession(
       {
         sessionID,
         directory: input.directory,
-        model: input.model,
+        model: { providerID: input.model.providerID, modelID: input.model.modelID },
         system: input.system,
         // Every tool off: the judge classifies, it never executes.
         tools: { read: false, write: false, edit: false, bash: false, webfetch: false, todoread: false, todowrite: false },
@@ -124,7 +171,7 @@ async function runJudgeSession(
   }
 }
 
-export async function judgeCommand(client: OpencodeClient, input: JudgeInput): Promise<SafetyVerdict> {
+export async function judgeCommand(client: OpencodeClient | undefined, input: JudgeInput): Promise<SafetyVerdict> {
   try {
     const text = await runJudgeSession(client, {
       directory: input.directory,
@@ -133,6 +180,8 @@ export async function judgeCommand(client: OpencodeClient, input: JudgeInput): P
       text: renderRequest(input.request),
       signal: input.signal,
       timeoutMs: input.timeoutMs ?? defaultTimeoutMs,
+      ...(input.auth ? { auth: input.auth } : {}),
+      ...(input.inferenceSeams ? { inferenceSeams: input.inferenceSeams } : {}),
     })
     const verdict = parseVerdict(text)
     if (!verdict) {
@@ -157,7 +206,7 @@ export type ExplainInput = JudgeInput & {
  * Unlike `judgeCommand`, this is not fail-closed: on error or timeout it returns
  * a human-readable fallback string instead of throwing.
  */
-export async function explainCommand(client: OpencodeClient, input: ExplainInput): Promise<string> {
+export async function explainCommand(client: OpencodeClient | undefined, input: ExplainInput): Promise<string> {
   try {
     const text = await runJudgeSession(client, {
       directory: input.directory,
@@ -166,6 +215,8 @@ export async function explainCommand(client: OpencodeClient, input: ExplainInput
       text: renderRequest(input.request, input.verdictReason),
       signal: input.signal,
       timeoutMs: input.timeoutMs ?? defaultExplainTimeoutMs,
+      ...(input.auth ? { auth: input.auth } : {}),
+      ...(input.inferenceSeams ? { inferenceSeams: input.inferenceSeams } : {}),
     })
     return text || "the judge returned an empty explanation"
   } catch (error) {
