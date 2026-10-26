@@ -7,9 +7,6 @@ import { loadMergedConvoyConfig } from "./config"
 import { specToolFor, specToolOf, specTools, type SpecArtifactSection, type SpecToolDescriptor, type SpecToolId } from "./spec-tools"
 import type { BoardSource } from "./board-refresh"
 import type { TuiRoute } from "./tui-session"
-import {
-  collectDirRelativeMarkdown,
-} from "./openspec"
 
 /**
  * Read-only specs viewer data layer (change `worktree-control-center`, tasks
@@ -189,7 +186,7 @@ export async function loadSpecsChangeAt(changeRoot: string, id: string, checkout
   } catch {
     // A change without a readable proposal still lists by its id.
   }
-  const relatives = await collectDirRelativeMarkdown(changeRoot, ".")
+  const relatives = await tool.changeFiles(changeRoot, ".")
   // Absolute so the browser's readFile resolves regardless of its cwd.
   const fileBase = resolve(changeRoot)
   const artifacts = relatives.map((relative) => ({

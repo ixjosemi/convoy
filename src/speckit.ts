@@ -2,7 +2,8 @@ import { lstat, readdir, readFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
 
 import { observeCheckoutTaskCounts, type LocalActiveChange, type LocalArchiveEntry, type LocalCanonicalSpec, type ReadActiveChangesOptions, type ReadResult } from "./checkout-openspec"
-import { collectDirRelativeMarkdown, stripYamlFrontmatter } from "./openspec"
+import { isTextAttachment } from "./attachments"
+import { collectDirRelativeFiles, collectDirRelativeMarkdown, stripYamlFrontmatter } from "./openspec"
 import type { SpecBundle } from "./spec-tools"
 import { countCheckboxTasks, type BoardTasks } from "./task-counts"
 
@@ -57,9 +58,20 @@ export function whyFromSpec(body: string): string | undefined {
   return unquoted || undefined
 }
 
+/**
+ * A feature's documents, relative to `relativeRoot` and sorted: every markdown
+ * file, plus every text file under `contracts/`, where `/speckit.plan` may
+ * write OpenAPI, JSON Schema, GraphQL or protobuf instead of markdown.
+ */
+export async function collectFeatureFiles(featureDir: string, relativeRoot: string): Promise<string[]> {
+  const markdown = await collectDirRelativeMarkdown(featureDir, relativeRoot)
+  const contracts = await collectDirRelativeFiles(join(featureDir, "contracts"), join(relativeRoot, "contracts"), (name) => !name.endsWith(".md") && isTextAttachment(name))
+  return [...markdown, ...contracts].sort()
+}
+
 async function describeFeature(checkout: string, changeId: string): Promise<LocalActiveChange> {
   const sourcePath = join(checkout, "specs", changeId)
-  const files = await collectDirRelativeMarkdown(sourcePath, ".")
+  const files = await collectFeatureFiles(sourcePath, ".")
   const spec = await readLocalFile(join(sourcePath, "spec.md"))
   const tasks = await readLocalFile(join(sourcePath, "tasks.md"))
   return {
@@ -145,7 +157,7 @@ export async function loadSpecKitBundle(input: { targetDir: string; explicitIds?
   if (canonical.kind === "unknown") throw new Error(canonical.reason)
   const specFiles = canonical.value.map(() => ".specify/memory/constitution.md")
   for (const id of changeIds) {
-    specFiles.push(...await collectDirRelativeMarkdown(join(input.targetDir, "specs", id), join("specs", id)))
+    specFiles.push(...await collectFeatureFiles(join(input.targetDir, "specs", id), join("specs", id)))
   }
   return { tool: "speckit", changeIds, specFiles, rootDir: resolve(input.targetDir) }
 }

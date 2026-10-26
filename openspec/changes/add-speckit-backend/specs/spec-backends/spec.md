@@ -43,11 +43,15 @@ For a Spec Kit feature, Convoy SHALL count tasks in its `tasks.md` the same way 
 - **THEN** the feature reports 1 of 2 tasks done
 
 ### Requirement: Spec Kit contract bundle
-When Spec Kit changes are selected for a run, the contract bundle SHALL be `.specify/memory/constitution.md`, when present, followed by every Markdown file under each selected feature directory in the selected order, including nested `contracts/` and `checklists/`. Files SHALL be repository-relative paths in the run's checkout and attached to every agent step, as OpenSpec bundles are.
+When Spec Kit changes are selected for a run, the contract bundle SHALL be `.specify/memory/constitution.md`, when present, followed by every Markdown file under each selected feature directory in the selected order, including nested `contracts/` and `checklists/`, plus every non-Markdown text file under `contracts/`. Files SHALL be repository-relative paths in the run's checkout and attached to every agent step, as OpenSpec bundles are.
 
 #### Scenario: Bundle contents
 - **WHEN** a run selects `001-login`, whose directory holds `spec.md`, `plan.md`, `tasks.md`, `research.md`, and `contracts/api.md`, and the repository has a constitution
 - **THEN** every agent step receives the constitution and those five files, and no file from another feature
+
+#### Scenario: Non-Markdown contracts
+- **WHEN** the selected feature's `contracts/` holds `openapi.yaml`, `schema.graphql`, `auth.proto`, `diagram.png`, and a hidden `.draft.yaml`
+- **THEN** the bundle includes `openapi.yaml`, `schema.graphql`, and `auth.proto`, and omits the binary and the hidden file
 
 ### Requirement: Spec Kit commands in a step resolve the selected feature
 When a run selects exactly one Spec Kit feature, every agent step SHALL run with `SPECIFY_FEATURE_DIRECTORY` set to that feature's absolute directory in the run's checkout, and with `SPECIFY_FEATURE_NO_PERSIST=1`. With zero or several selected features, neither variable SHALL be set by Convoy.

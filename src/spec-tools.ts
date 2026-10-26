@@ -13,7 +13,7 @@ import { join, relative } from "node:path"
 import type { ConvoyConfig } from "./config"
 import { readCheckoutActiveChanges, readCheckoutArchives, readCheckoutCanonicalSpecs, type LocalActiveChange, type LocalArchiveEntry, type LocalCanonicalSpec, type ReadActiveChangesOptions, type ReadResult } from "./checkout-openspec"
 import { collectDirRelativeMarkdown, isOpenSpecChangeId, listOpenSpecChanges, loadOpenSpecBundle, openSpecBranchPrefix, openSpecPromptFor, titleFromProposal, whyFromProposal } from "./openspec"
-import { listSpecKitChanges, loadSpecKitBundle, readSpecKitActiveChanges, readSpecKitCompleted, readSpecKitConstitution, specKitStepEnv, specKitTaskCounts, titleFromSpec, whyFromSpec } from "./speckit"
+import { collectFeatureFiles, listSpecKitChanges, loadSpecKitBundle, readSpecKitActiveChanges, readSpecKitCompleted, readSpecKitConstitution, specKitStepEnv, specKitTaskCounts, titleFromSpec, whyFromSpec } from "./speckit"
 import { openspecTaskCounts, type BoardTasks } from "./task-counts"
 
 export const specToolIds = Object.freeze(["openspec", "speckit"] as const)
@@ -71,6 +71,8 @@ export type SpecToolDescriptor = {
   /** Checkout-relative roots that mark the tool present and refresh the live board. */
   readonly fingerprintRoots: readonly string[]
   readonly groups: readonly SpecReaderGroup[]
+  /** A change directory's reader and bundle documents, relative to `relativeRoot`, sorted. */
+  readonly changeFiles: (changeDir: string, relativeRoot: string) => Promise<string[]>
   readonly readActiveChanges: (checkout: string, options?: ReadActiveChangesOptions) => Promise<ReadResult<LocalActiveChange[]>>
   readonly readSettled: (checkout: string) => Promise<ReadResult<LocalArchiveEntry[]>>
   readonly readCanonical: (checkout: string) => Promise<ReadResult<LocalCanonicalSpec[]>>
@@ -123,6 +125,7 @@ export const specTools: Readonly<Record<SpecToolId, SpecToolDescriptor>> = Objec
       { kind: "delta", label: "Delta Specs", files: [], prefixes: ["specs/"], headings: true },
       { kind: "other", label: "Other", files: [] },
     ],
+    changeFiles: collectDirRelativeMarkdown,
     readActiveChanges: readCheckoutActiveChanges,
     readSettled: readCheckoutArchives,
     readCanonical: readCheckoutCanonicalSpecs,
@@ -163,6 +166,7 @@ export const specTools: Readonly<Record<SpecToolId, SpecToolDescriptor>> = Objec
       { kind: "design-docs", label: "Design Docs", files: ["research.md", "data-model.md", "quickstart.md"], prefixes: ["contracts/"], headings: true },
       { kind: "other", label: "Other", files: [] },
     ],
+    changeFiles: collectFeatureFiles,
     readActiveChanges: readSpecKitActiveChanges,
     readSettled: readSpecKitCompleted,
     readCanonical: readSpecKitConstitution,

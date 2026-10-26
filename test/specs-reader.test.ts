@@ -122,7 +122,7 @@ describe("the fullscreen reader", () => {
   test("Spec Kit Design Docs share per-file headings between the reader and clipboard", async () => {
     const feature = join(root, "specs", "001-login")
     await mkdir(join(feature, "contracts"), { recursive: true })
-    for (const file of ["spec.md", "plan.md", "tasks.md", "research.md", "data-model.md", "contracts/login.md"]) {
+    for (const file of ["spec.md", "plan.md", "tasks.md", "research.md", "data-model.md", "contracts/login.md", "contracts/openapi.yaml"]) {
       await writeFile(join(feature, file), file === "spec.md" ? "# Feature Specification: Login\n" : `Content for ${file}\n`)
     }
     const entry = await loadSpecsChangeAt(feature, "001-login", root, specTools.speckit)
@@ -136,7 +136,7 @@ describe("the fullscreen reader", () => {
       session.press("c")
       await Bun.sleep(20)
       const copied = session.clipboard.copied[0]!
-      for (const file of ["research.md", "data-model.md", "contracts/login.md"]) expect(copied).toContain(`## ${file}\n\nContent for ${file}`)
+      for (const file of ["research.md", "data-model.md", "contracts/login.md", "contracts/openapi.yaml"]) expect(copied).toContain(`## ${file}\n\nContent for ${file}`)
       expect(copied).not.toContain("Delta Specs")
     } finally {
       await closeSession(session)

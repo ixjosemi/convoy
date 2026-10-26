@@ -75,7 +75,7 @@ With active changes, the skill requires your contract choice: `--change <id>` (o
 - Otherwise it lists the active changes, suggests the one named like your branch or the only one, and asks: that change, others, or none (`--manual`). It waits for your answer before planning — it never selects a suggestion or silently falls back to `--manual`.
 - With no active changes in the configured layout (including an absent root), or `features.specs: false`, it passes `--manual`. Unreadable discovery remains unknown and is reported, not treated as an empty list.
 
-The plan names the attached OpenSpec change or Spec Kit feature. With a change attached, no prompt is needed. The [spec bundle](openspec.md) is OpenSpec's current specs plus change artifacts, or Spec Kit's constitution (when present) plus every feature Markdown file, including nested contracts and checklists. Every agent step receives it, and grading follows that tool's acceptance criteria.
+The plan names the attached OpenSpec change or Spec Kit feature. With a change attached, no prompt is needed. The [spec bundle](openspec.md) is OpenSpec's current specs plus change artifacts, or Spec Kit's constitution (when present) plus every feature Markdown file, including nested contracts and checklists, and the text contract schemas under `contracts/`. Every agent step receives it, and grading follows that tool's acceptance criteria.
 
 ## Ad hoc pipelines
 

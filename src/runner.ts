@@ -1864,7 +1864,7 @@ async function scopeContractFiles(options: RunOptions, excludeRunID: string): Pr
 }
 
 /**
- * Attaches every markdown file of the frozen contract bundle. Empty when
+ * Attaches every file of the frozen contract bundle. Empty when
  * no change resolved, so callers can always concatenate it.
  */
 async function specBundleFileParts(options: RunOptions): Promise<FilePartInput[]> {

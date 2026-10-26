@@ -72,7 +72,7 @@ With active changes, selection is explicit only: `--change <id>` (repeatable, in
 - Active changes exist and the user named none: list them with their titles, say which one fits (the one named like the current branch, `feat/001-login` ↔ `001-login`, or the only one), and ask whether to run against it, against others, or with no change (`--manual`). Wait for their answer before planning. Don't choose silently, and don't fall back to `--manual` without asking.
 - No active changes in the configured layout (including an absent root), or specs off: pass `--manual`. Unreadable discovery is unknown, not an empty list: report it and ask rather than silently using `--manual`.
 
-Convoy attaches the selected contract to every agent step: OpenSpec's current specs plus proposal/design/tasks/delta specs, or Spec Kit's constitution (when present) plus every Markdown file in each selected feature, including nested contracts and checklists. With a change selected, the spec is the contract and the prompt is optional: `convoy -p implement --change 001-login` needs nothing else under Spec Kit.
+Convoy attaches the selected contract to every agent step: OpenSpec's current specs plus proposal/design/tasks/delta specs, or Spec Kit's constitution (when present) plus every Markdown file in each selected feature, including nested contracts and checklists, and the text contract schemas under `contracts/`. With a change selected, the spec is the contract and the prompt is optional: `convoy -p implement --change 001-login` needs nothing else under Spec Kit.
 
 ## 4. Write the prompt
 

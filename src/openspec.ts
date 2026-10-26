@@ -291,6 +291,11 @@ async function collectMarkdownFiles(root: string): Promise<string[]> {
  * humans instead of building a runner bundle.
  */
 export async function collectDirRelativeMarkdown(root: string, relativeRoot: string): Promise<string[]> {
+  return collectDirRelativeFiles(root, relativeRoot, (name) => name.endsWith(".md"))
+}
+
+/** The same walk as `collectDirRelativeMarkdown`, keeping the files whose name `include` accepts. */
+export async function collectDirRelativeFiles(root: string, relativeRoot: string, include: (name: string) => boolean): Promise<string[]> {
   let dirents
   try {
     // lstat, not stat/readdir: a symlinked root is not a directory here, so the
@@ -306,8 +311,8 @@ export async function collectDirRelativeMarkdown(root: string, relativeRoot: str
     if (entry.isSymbolicLink()) continue
     const relative = join(relativeRoot, entry.name)
     if (entry.isDirectory()) {
-      out.push(...(await collectDirRelativeMarkdown(join(root, entry.name), relative)))
-    } else if (entry.name.endsWith(".md")) {
+      out.push(...(await collectDirRelativeFiles(join(root, entry.name), relative, include)))
+    } else if (entry.isFile() && include(entry.name)) {
       out.push(relative)
     }
   }

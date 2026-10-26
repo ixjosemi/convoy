@@ -149,6 +149,24 @@ describe("Spec Kit checkout readers", () => {
     expect(await readSpecKitConstitution(dir)).toEqual({ kind: "known", value: [{ checkout: dir, capability: "constitution", sourcePath: join(dir, ".specify/memory/constitution.md") }] })
   })
 
+  test("contract schemas in any text format join the bundle, the inventory, and the reader", async () => {
+    const dir = await checkout()
+    await put(dir, "specs/001-login/spec.md", spec)
+    await put(dir, "specs/001-login/plan.md", "# Plan\n")
+    await put(dir, "specs/001-login/contracts/openapi.yaml", "openapi: 3.1.0\n")
+    await put(dir, "specs/001-login/contracts/events/login.schema.json", "{}\n")
+    await put(dir, "specs/001-login/contracts/schema.graphql", "type Query { me: User }\n")
+    await put(dir, "specs/001-login/contracts/auth.proto", 'syntax = "proto3";\n')
+    await put(dir, "specs/001-login/contracts/diagram.png", "\x89PNG\r\n")
+    await put(dir, "specs/001-login/contracts/.draft.yaml", "draft: true\n")
+    await put(dir, "specs/001-login/notes.yaml", "outside: contracts\n")
+    const contracts = ["contracts/auth.proto", "contracts/events/login.schema.json", "contracts/openapi.yaml", "contracts/schema.graphql"]
+    expect((await loadSpecKitBundle({ targetDir: dir, explicitIds: ["001-login"] }))?.specFiles).toEqual([
+      ...contracts.map((file) => `specs/001-login/${file}`), "specs/001-login/plan.md", "specs/001-login/spec.md",
+    ])
+    expect(await readSpecKitActiveChanges(dir)).toMatchObject({ kind: "known", value: [{ changeId: "001-login", artifacts: { other: contracts } }] })
+  })
+
   test("unreadable tasks stay active and unknown, never completed", async () => {
     const dir = await checkout()
     await put(dir, "specs/001-login/spec.md", spec)
