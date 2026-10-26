@@ -101,6 +101,23 @@ export function titleFromProposal(body: string, fallback: string): string {
   return line || fallback
 }
 
+/** Proposal rationale up to the next section, without YAML metadata. */
+export function whyFromProposal(body: string): string | undefined {
+  const lines = stripYamlFrontmatter(body).split(/\r?\n/)
+  const start = lines.findIndex((line) => /^##\s+why\b/i.test(line.trim()))
+  if (start === -1) return undefined
+  const end = lines.findIndex((line, index) => index > start && /^##\s/.test(line.trim()))
+  return lines.slice(start + 1, end === -1 ? lines.length : end).join("\n").trim() || undefined
+}
+
+/** OpenSpec alone infers branch types from its delta operations. */
+export async function openSpecBranchPrefix(changeDir: string): Promise<string> {
+  const files = await collectDirRelativeMarkdown(join(changeDir, "specs"), ".")
+  const bodies = await Promise.all(files.map((file) => readFile(join(changeDir, "specs", file), "utf8")))
+  const { inferChangePrefix } = await import("./worktree")
+  return inferChangePrefix(bodies)
+}
+
 /**
  * Lists active (non-archived) changes for the launcher picker. Cheap: only
  * reads each change's `proposal.md` for a title. Returns `[]` when `openspec/`
